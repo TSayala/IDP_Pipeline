@@ -2,7 +2,14 @@ import torch
 import psutil
 import os
 import re
+import string
+import nltk
+nltk.download('stopwords')
+from nltk.corpus import stopwords
 import spacy
+from spacy.language import Language
+from spacy.tokens import Doc
+from collections import Counter
 import numpy as np
 from PIL import Image, UnidentifiedImageError
 import pytesseract
@@ -55,80 +62,134 @@ class UnsupervisedDocumentAnalyzer:
     self.tokenizer = AutoTokenizer.from_pretrained(model_name)
     self.model = AutoModelForSequenceClassification.from_pretrained(model_name).to(self.device)
     self.classifier = pipeline('zero-shot-classification', model=self.model, tokenizer=self.tokenizer, device=0 if self.device == 'cuda' else -1)
-    self.summarizer = pipeline('summarization', model='facebook/bart-large-cnn', device=0 if self.device == 'cuda' else -1)
+    self.summarizer = pipeline('summarization', model='google/pegasus-xsum', device=0 if self.device == 'cuda' else -1)
     self.nlp = spacy.load('en_core_web_sm')
+    self.nlp.add_pipe('sentencizer')
     self.vectorizer = TfidfVectorizer(max_features=1000)
     self.kmeans = KMeans(n_clusters=15, random_state=42)
     self.max_chunk_length = 1024
 
+  def preprocessText(self, text):
+    text = text.lower() # Convert to lowercase
+    text = re.sub(r'\d+', '', text) # Remove digits
+    text = re.sub(r'[^a-zA-Z0-9\s]', '', text) # Remove non-alphanumeric characters except spaces
+    tokens = nltk.word_tokenize(text)
+    return tokens
+  
+  def removeStopwords(self, tokens):
+    stop_words = set(stopwords.words('english'))
+    filtered_tokens = [word for word in tokens if word not in stop_words]
+    return filtered_tokens
+  
+  def lemmatizeText(self, tokens):
+    lemmatizer = nltk.WordNetLemmatizer()
+    lemmatized_tokens = [lemmatizer.lemmatize(token) for token in tokens]
+    return lemmatized_tokens
+  
   def cleanText(self, text):
-    cleaned = re.sub(r'©.*?AM', '', text)
-    cleaned = re.sub(r'~.*?of \d', '', cleaned) # Remove page numbers
-    cleaned = re.sub(r'\n+', '\n', cleaned) # Replace multiple newlines with single newline
-    cleaned = re.sub(r'\s+', ' ', cleaned) # Replace multiple spaces with single space
-    cleaned = re.sub(r'In(?=\w)', '\n', cleaned) # Add newline after 'In' at the start of a sentence
-    cleaned = re.sub(r'(?<=\w)In', '\n', cleaned) # Add newline before 'In' at the end of a sentence
-
-    cleaned = re.sub(r'[^\w\s\.\,\:\-\(\)]', '', cleaned) # Remove special characters except .,:-()
-
-    lines = [line.strip() for line in cleaned.split('\n') if line.strip()]
-    return '\n'.join(lines)
+    tokens = self.preprocessText(text)
+    filtered_tokens = self.removeStopwords(tokens)
+    lemmatized_tokens = self.lemmatizeText(filtered_tokens)
+    return " ".join(lemmatized_tokens)
     
+  @Language.component("extract_key_phrases")
+  def extract_key_phrases(self, doc):
+    noun_chunks = list(doc.noun_chunks)
+    verb_phrases = [span for span in doc if span.root.pos_ == 'VERB']
+    doc._.key_phrases = noun_chunks + verb_phrases
+    return doc
 
   # Extract key information from the text
   def extractKeyInfo(self, text):
+    doc = self.nlp(text[:1000000])
 
-    patterns = {
-      'Date': r'\d{2}-\d{2}-\d{4}', # DD-MM-YYYY
-      'Patient': r'Patient:\s*([\w\s]+)',
-      'DOB': r'Date of Birth:\s*([\d\-]+)',
+    # Extract named entities
+    entities = {ent.label_: ent.text for ent in doc.ents if ent.label_ in ['DATE', 'PERSON', 'ORG']}
+
+    # Extract key phrases
+    if "extract_key_phrases" not in self.nlp.pipe_names:
+      self.nlp.add_pipe("extract_key_phrases", last=True)
+    Doc.set_extension("key_phrases", default=[], force=True)
+    key_phrases = [chunk.text for chunk in doc._.key_phrases if len(chunk.text.split()) > 1][:5] # Extract only top 5 phrases with more than one word
+
+    # Extract important sentences
+    sentences = list(doc.sents)
+    sentence_importance = []
+    for sent in sentences:
+      importance_score = sum([token.is_alpha and not token.is_stop for token in sent]) / len(sent)
+      sentence_importance.append((sent.text, importance_score))
+    important_sentences = sorted(sentence_importance, key=lambda x: x[1], reverse=True)[:3]
+
+    # Combine all key information
+    key_info = {
+      'Entities': entities,
+      'Key_Phrases': key_phrases,
+      'Important_Sentences': [sent for sent, _ in important_sentences]
     }
-    
-    """ date_pattern = r'\d{2}-\d{2}-\d{4}' # DD-MM-YYYY
-    phone_pattern = r'\d{3}-\d{3}-\d{4}' # 123-456-7890
-    name_pattern = r'(?:From:|Comment:)\s*([\w\s]+)'
-
-    date = re.search(date_pattern, text)
-    phone = re.search(phone_pattern, text)
-    name = re.search(name_pattern, text) """
-
-    key_info = []
-    for key, pattern in patterns.items():
-      match = re.search(pattern, text, re.DOTALL)
-      if match:
-        key_info[key] = match.group(1).strip()
 
     return key_info
   
   # Extract the main content from the text
   def extractMainContent(self, text):
-    doc = self.nlp(text)
-    content_sentences = [sent.text for sent in doc.sents if len(sent) > 5 and not sent.text.isupper()]
-    return " ".join(content_sentences)
+    try:
+      doc = self.nlp(text[:1000000])
+      content_sentences = [sent.text for sent in doc.sents if len(sent) > 5 and not sent.text.isupper()]
+      return " ".join(content_sentences) if content_sentences else ""
+    except Exception as e:
+      logger.error(f"Error extracting main content: {type(e).__name__} - {str(e)}")
+      return ""
   
   # Summarize the text
   def summarize(self, text, file_name):
     try:
-      logger.debug(f"File '{file_name}': Attempting to clean and summarize text of length {len(text)} characters")
+      logger.debug(f"File '{file_name}': Attempting to summarize text of length {len(text)} characters")
 
       cleaned_text = self.cleanText(text)
-
-      key_info = self.extractKeyInfo(cleaned_text)
-      main_content = self.extractMainContent(cleaned_text)
-
-      if len(main_content.split()) < 30:
-        logger.warning(f"File '{file_name}': Text too short for summarization: {len(main_content.split())} words")
-        return f"{key_info}\nContent: {main_content}"
+      if not cleaned_text.strip():
+        logger.warning(f"File '{file_name}': Cleaned text is empty")
+        return "Key Info: {}\nSummary: Empty document"
       
-      summary = self.summarizer(main_content, max_length=150, min_length=30, do_sample=False)[0]['summary_text']
-      final_summary = f"Key Info: {key_info}\nSummary: {summary}"   
+      key_info = self.extractKeyInfo(cleaned_text)
+      chunks = self.chunkText(cleaned_text)
 
-      logger.debug(f"File '{file_name}': Summary successful. Final summary length: {len(final_summary)} characters")
-      return final_summary
+      summaries = []
+      for i, chunk in enumerate(chunks):
+        try:
+          summary_result = self.summarizer(chunk, max_length=150, min_length=30, do_sample=False)
+          if summary_result and isinstance(summary_result, list) and len(summary_result) > 0:
+            summary = summary_result[0].get('summary_text', '').strip()
+            if summary:
+              summaries.append(summary)
+          else:
+            logger.warning(f"File '{file_name}': Summarizer returned unexpected result for chunk {i+1}")
+        except Exception as e:
+          logger.error(f"File '{file_name}': Error summarizing chunk {i+1}: {type(e).__name__} - {str(e)}")
+      
+      if not summaries:
+        logger.warning(f"File '{file_name}': No valid summaries generated")
+        return f"Key Info: {key_info}\nSummary: {cleaned_text[:300]}... (truncated)"
+      
+      combined_summary = " ".join(summaries)
+
+      # Generate final summary
+      try:
+        final_summary_result = self.summarizer(combined_summary, max_length=200, min_length=50, do_sample=False)
+        if final_summary_result and isinstance(final_summary_result, list) and len(final_summary_result) > 0:
+          final_summary = final_summary_result[0].get('summary_text', '').strip()
+        else:
+          logger.warning(f"File '{file_name}': Summarizer returned unexpected result for final summary")
+          final_summary = combined_summary
+      except Exception as e:
+        logger.error(f"File '{file_name}': Error generating final summary: {type(e).__name__} - {str(e)}")
+        final_summary = combined_summary
+
+      result = f"Key Info: {key_info}\nSummary: {final_summary}"
+      logger.debug(f"File '{file_name}': Summarization successful. Result length: {len(final_summary)} characters")
+      return result
     
     except Exception as e:
-      logger.error(f"File '{file_name}': Error in summarization: {str(e)}")
-      return text[:512] + '... (truncated)' if len(text) > 512 else text
+      logger.error(f"File '{file_name}': Error in summarization: {type(e).__name__} - {str(e)}")
+      return f"Key Info: {{}}\nSummary: Error in summarization: {type(e).__name__} - {str(e)}"
   
   # Classify the text
   def classify(self, text, labels, file_name):
@@ -185,6 +246,7 @@ def processDocument(args):
   result = {
     'file_path': file_path,
     'summary': None,
+    'key_info': None,
     'category': None,
     'confidence': None,
     'status': 'error',
@@ -201,20 +263,29 @@ def processDocument(args):
       logger.warning(f"File '{file_path}': Extracted text is empty for file: {file_path}")
       raise ValueError("Extracted text is empty")
     
-    summary = analyzer.summarize(document_text, file_path)
-    category, confidence = analyzer.classify(summary, labels, file_path)
+    summary_result = analyzer.summarize(document_text, file_path)
+    if summary_result.startswith("Key Info: {}"):
+      result['error_message'] = summary_result.split('\nSummary: ', 1)[1]
+      result['status'] = 'error'
+      return result
+    
+    key_info_str, abstractive_summary = summary_result.split('\nSummary: ', 1)
+    key_info = eval(key_info_str.replace("Key Info: ", ""))
 
-    """ summary, category, confidence = analyzer.analyzeDocument(document_text, labels)
-    if summary is None or category is None or confidence is None:
-      logger.warning(f'Error processing document {file_path}: Summary: {summary}, Category: {category}, Confidence: {confidence}')
-      raise ValueError('Analysis failed') """
+    result['summary'] = abstractive_summary
+    result['key_info'] = key_info
 
-    result.update({
-      'summary': summary,
-      'category': category,
-      'confidence': confidence,
-      'status': 'success' if category and confidence else 'partial success'
-    })
+    if abstractive_summary:
+      category, confidence = analyzer.classify(abstractive_summary, labels, file_path)
+      result.update({
+        'category': category,
+        'confidence': confidence,
+        'status': 'success' if category and confidence else 'partial success'
+      })
+    else:
+      result['status'] = 'partial success'
+      logger.warning(f"File '{file_path}': Empty abstractive summary, classification skipped")
+
     logger.info(f"File '{file_path}': Processing complete (Status: {result["status"]})")
 
   except Exception as e:
