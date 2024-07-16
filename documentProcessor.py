@@ -8,7 +8,7 @@ nltk.download('stopwords')
 from nltk.corpus import stopwords
 import spacy
 from spacy.language import Language
-from spacy.tokens import Doc
+from spacy.tokens import Doc, Span
 from collections import Counter
 import numpy as np
 from PIL import Image, UnidentifiedImageError
@@ -63,8 +63,16 @@ class UnsupervisedDocumentAnalyzer:
     self.model = AutoModelForSequenceClassification.from_pretrained(model_name).to(self.device)
     self.classifier = pipeline('zero-shot-classification', model=self.model, tokenizer=self.tokenizer, device=0 if self.device == 'cuda' else -1)
     self.summarizer = pipeline('summarization', model='google/pegasus-xsum', device=0 if self.device == 'cuda' else -1)
+    
     self.nlp = spacy.load('en_core_web_sm')
     self.nlp.add_pipe('sentencizer')
+    if not Doc.has_extension("key_phrases"):
+      Doc.set_extension("key_phrases", default=[])
+    if not Span.has_extension("importance_score"):
+      Span.set_extension("importance_score", default=0.0)
+    self.nlp.add_pipe("extractKeyPhrases", last=True)
+    self.nlp.add_pipe("calculateSentenceImportance", last=True)
+    
     self.vectorizer = TfidfVectorizer(max_features=1000)
     self.kmeans = KMeans(n_clusters=15, random_state=42)
     self.max_chunk_length = 1024
@@ -92,42 +100,79 @@ class UnsupervisedDocumentAnalyzer:
     lemmatized_tokens = self.lemmatizeText(filtered_tokens)
     return " ".join(lemmatized_tokens)
     
-  @Language.component("extract_key_phrases")
-  def extract_key_phrases(self, doc):
-    noun_chunks = list(doc.noun_chunks)
-    verb_phrases = [span for span in doc if span.root.pos_ == 'VERB']
-    doc._.key_phrases = noun_chunks + verb_phrases
+  @staticmethod
+  @Language.component("extractKeyPhrases")
+  def extractKeyPhrases(doc):
+    for chunk in doc.noun_chunks:
+      doc._.key_phrases.append(chunk)
+    for token in doc:
+      if token.pos == "VERB":
+        verb_phrase = list(token.subtree)
+        start = verb_phrase[0].i
+        end = verb_phrase[-1].i + 1
+        doc._.key_phrases.append(doc[start:end])
     return doc
-
+  
+  @staticmethod
+  @Language.component("calculateSentenceImportance")
+  def calculateSentenceImportance(doc):
+    for sent in doc.sents:
+      importance_score = sum([token.is_alpha and not token.is_stop for token in sent]) / len(sent)
+      sent._.importance_score = importance_score
+    return doc
+  
   # Extract key information from the text
-  def extractKeyInfo(self, text):
+  def extractKeyInfo(self, text):    
     doc = self.nlp(text[:1000000])
 
     # Extract named entities
     entities = {ent.label_: ent.text for ent in doc.ents if ent.label_ in ['DATE', 'PERSON', 'ORG']}
 
     # Extract key phrases
-    if "extract_key_phrases" not in self.nlp.pipe_names:
-      self.nlp.add_pipe("extract_key_phrases", last=True)
-    Doc.set_extension("key_phrases", default=[], force=True)
     key_phrases = [chunk.text for chunk in doc._.key_phrases if len(chunk.text.split()) > 1][:5] # Extract only top 5 phrases with more than one word
 
     # Extract important sentences
-    sentences = list(doc.sents)
-    sentence_importance = []
-    for sent in sentences:
-      importance_score = sum([token.is_alpha and not token.is_stop for token in sent]) / len(sent)
-      sentence_importance.append((sent.text, importance_score))
-    important_sentences = sorted(sentence_importance, key=lambda x: x[1], reverse=True)[:3]
+    important_sentences = sorted(doc.sents, key=lambda s: s._.importance_score, reverse=True)[:3]
+    important_sentences = [sent.text for sent in important_sentences]
 
     # Combine all key information
     key_info = {
       'Entities': entities,
       'Key_Phrases': key_phrases,
-      'Important_Sentences': [sent for sent, _ in important_sentences]
+      'Important_Sentences': important_sentences
     }
 
     return key_info
+  
+  def chunkText(self, text):
+    """
+    Split the input text into chunks of specified maximum length.
+
+    Args:
+    text (str): The input text to split into chunks.
+    max_chunk_length (int): The maximum length of each chunk.
+
+    Returns:
+    List[str]: A list of text chunks.
+    """
+    doc = self.nlp(text)
+    chunks = []
+    current_chunk = []
+    current_chunk_length = 0
+    
+    for sent in doc.sents:
+      if current_chunk_length + len(sent) <= self.max_chunk_length:
+        current_chunk.append(sent.text)
+        current_chunk_length += len(sent)
+      else:
+        chunks.append(" ".join(current_chunk))
+        current_chunk = [sent.text]
+        current_chunk_length = len(sent)
+
+    if current_chunk:
+      chunks.append(" ".join(current_chunk))
+    
+    return chunks
   
   # Extract the main content from the text
   def extractMainContent(self, text):
