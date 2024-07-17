@@ -2,3 +2,4 @@ data/
 document_processor.log
 __pycache__
 testSummary.ipynb
+.vscode

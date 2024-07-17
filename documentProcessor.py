@@ -206,30 +206,47 @@ class UnsupervisedDocumentAnalyzer:
       summaries = []
       for i, chunk in enumerate(chunks):
         try:
+          logger.debug(f"File '{file_name}': Summarizing chunk {i+1} of {len(chunks)}")
           summary_result = self.summarizer(chunk, max_length=150, min_length=30, do_sample=False)
+
+          logger.debug(f"File '{file_name}': Raw summary result for chunk {i+1}: {summary_result}")
+
           if summary_result and isinstance(summary_result, list) and len(summary_result) > 0:
             summary = summary_result[0].get('summary_text', '').strip()
             if summary:
               summaries.append(summary)
+              logger.debug(f"File '{file_name}': Successfully summarized chunk {i+1}. Length: {len(summary)} characters")
           else:
             logger.warning(f"File '{file_name}': Summarizer returned unexpected result for chunk {i+1}")
+        except IndexError as e:
+          logger.error(f"File '{file_name}': IndexError summarizing chunk {i+1}: {str(e)}")
         except Exception as e:
           logger.error(f"File '{file_name}': Error summarizing chunk {i+1}: {type(e).__name__} - {str(e)}")
       
       if not summaries:
         logger.warning(f"File '{file_name}': No valid summaries generated")
-        return f"Key Info: {key_info}\nSummary: {cleaned_text[:300]}... (truncated)"
+        return f"Key Info: {key_info}\nSummary: Unable to generate summary. Original text (truncated): {cleaned_text[:300]}..."
       
       combined_summary = " ".join(summaries)
 
       # Generate final summary
       try:
+        logger.debug(f"File '{file_name}': Generating final summary")
         final_summary_result = self.summarizer(combined_summary, max_length=200, min_length=50, do_sample=False)
+
+        logger.debug(f"File '{file_name}': Raw final summary result: {final_summary_result}")
+
         if final_summary_result and isinstance(final_summary_result, list) and len(final_summary_result) > 0:
           final_summary = final_summary_result[0].get('summary_text', '').strip()
+          if not final_summary:
+            logger.warning(f"File '{file_name}': Final summary is empty")
+            final_summary = combined_summary
         else:
-          logger.warning(f"File '{file_name}': Summarizer returned unexpected result for final summary")
+          logger.warning(f"File '{file_name}': Unexpected final summary result structure")
           final_summary = combined_summary
+      except IndexError as e:
+        logger.error(f"File '{file_name}': IndexError generating final summary: {str(e)}")
+        final_summary = combined_summary
       except Exception as e:
         logger.error(f"File '{file_name}': Error generating final summary: {type(e).__name__} - {str(e)}")
         final_summary = combined_summary
