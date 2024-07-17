@@ -54,6 +54,14 @@ def getLogger():
 
 logger = getLogger()
 
+def registerExtensions():
+  if not Doc.has_extension("key_phrases"):
+    Doc.set_extension("key_phrases", default=[])
+  if not Span.has_extension("importance_score"):
+    Span.set_extension("importance_score", default=0.0)
+
+registerExtensions()
+
 class UnsupervisedDocumentAnalyzer:
 
   # Initialize the model
@@ -65,11 +73,8 @@ class UnsupervisedDocumentAnalyzer:
     self.summarizer = pipeline('summarization', model='google/pegasus-xsum', device=0 if self.device == 'cuda' else -1)
     
     self.nlp = spacy.load('en_core_web_sm')
+
     self.nlp.add_pipe('sentencizer')
-    if not Doc.has_extension("key_phrases"):
-      Doc.set_extension("key_phrases", default=[])
-    if not Span.has_extension("importance_score"):
-      Span.set_extension("importance_score", default=0.0)
     self.nlp.add_pipe("extractKeyPhrases", last=True)
     self.nlp.add_pipe("calculateSentenceImportance", last=True)
     
@@ -101,8 +106,9 @@ class UnsupervisedDocumentAnalyzer:
     return " ".join(lemmatized_tokens)
     
   @staticmethod
-  @Language.component("extractKeyPhrases")
+  @spacy.Language.component("extractKeyPhrases")
   def extractKeyPhrases(doc):
+    doc._.key_phrases = []
     for chunk in doc.noun_chunks:
       doc._.key_phrases.append(chunk)
     for token in doc:
@@ -114,7 +120,7 @@ class UnsupervisedDocumentAnalyzer:
     return doc
   
   @staticmethod
-  @Language.component("calculateSentenceImportance")
+  @spacy.Language.component("calculateSentenceImportance")
   def calculateSentenceImportance(doc):
     for sent in doc.sents:
       importance_score = sum([token.is_alpha and not token.is_stop for token in sent]) / len(sent)
