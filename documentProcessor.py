@@ -2,7 +2,9 @@ import torch
 import psutil
 import os
 import re
+import io
 import string
+
 import nltk
 nltk.download('stopwords')
 from nltk.corpus import stopwords
@@ -10,15 +12,20 @@ import spacy
 from spacy.language import Language
 from spacy.tokens import Doc, Span
 from collections import Counter
+
 import numpy as np
 from PIL import Image, UnidentifiedImageError
 import pytesseract
+import cv2
+
 from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import KMeans
+
 from tqdm.notebook import tqdm
 import pandas as pd
 from concurrent.futures import ProcessPoolExecutor, as_completed
+
 import logging
 from logging.handlers import RotatingFileHandler
 
@@ -62,6 +69,62 @@ def registerExtensions():
 
 registerExtensions()
 
+class DocumentLayoutAnalyzer:
+  def __init__(self, n_clusters=15):
+    self.n_clusters = n_clusters
+    self.kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+
+  def extractLayoutFeatures(self, image):
+    try:
+      gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+      edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+      contours = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+      features = []
+      for contour in contours:
+        area = cv2.contourArea(contour)
+        x, y, w, h = cv2.boundingRect(contour)
+        aspect_ratio = float(w) / h
+        features.append([area, aspect_ratio])
+      return np.array(features)
+    except Exception as e:
+      logger.error(f"Error extracting layout features: {type(e).__name__} - {str(e)}")
+      return []
+    
+  def fit(self, images):
+    try:
+      all_features = []
+      for image in images:
+        features = self.extractLayoutFeatures(image)
+        all_features.extend(features)
+      self.kmeans.fit(all_features)
+    except Exception as e:
+      logger.error(f"Error fitting KMeans model: {type(e).__name__} - {str(e)}")
+
+  def predictLayout(self, image):
+    try:
+      features = self.extractLayoutFeatures(image)
+      labels = self.kmeans.predict(features)
+      return np.bincount(labels).argmax()
+    except Exception as e:
+      logger.error(f"Error predicting layout: {type(e).__name__} - {str(e)}")
+      return None
+
+class FaxCoverDetector:
+  def __init__(self):
+    self.keywords = ['fax', 'cover', 'sheet']
+
+  def isFaxCover(self, image):
+    try:
+      gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+      text = pytesseract.image_to_string(gray).lower()
+      keyword_count = sum(1 for keyword in self.keywords if keyword in text)
+      return keyword_count > len(self.keywords) / 2
+    except Exception as e:
+      logger.error(f"Error detecting fax cover: {type(e).__name__} - {str(e)}")
+      return False
+
+
+
 class UnsupervisedDocumentAnalyzer:
 
   # Initialize the model
@@ -81,6 +144,10 @@ class UnsupervisedDocumentAnalyzer:
     self.vectorizer = TfidfVectorizer(max_features=1000)
     self.kmeans = KMeans(n_clusters=15, random_state=42)
     self.max_chunk_length = 1024
+    self.labels = ['plan of care', 'discharge summary', 'prescription request',
+                   'progress note', 'prescription authorization', 'lab results',
+                   'result notification', 'formal records request', 'patient chart note',
+                   'return to work', 'answering service', 'spam', 'other']
 
   def preprocessText(self, text):
     text = text.lower() # Convert to lowercase
@@ -309,51 +376,46 @@ def readTifFile(file_path):
 
 # Process the document
 def processDocument(args):
-  file_path, analyzer, labels = args
+  file_path, classifier, fax_detector = args
 
   result = {
     'file_path': file_path,
-    'summary': None,
-    'key_info': None,
     'category': None,
     'confidence': None,
     'status': 'error',
     'error_message': None,
-    'text_length': 0
+    'text_length': 0,
+    'is_fax_cover': False,
+    'num_pages': 0
   }
 
   try:
     logger.info(f"Processing document {file_path}")
-    document_text = readTifFile(file_path)
-    result['text_length'] = len(document_text)
+    with Image.open(file_path) as img:
+      result['num_pages'] = img.n_frames
+      full_text = ""
+      for i in range(img.n_frames):
+        img.seek(i)
+        np_image = np.array(img)
+        if i == 0:
+          result['is_fax_cover'] = fax_detector.isFaxCover(np_image)
+          if result['is_fax_cover']:
+            logger.info(f"File '{file_path}': Detected a fax cover page.")
+            result['status'] = 'skipped'
+            return result
+          page_text = pytesseract.image_to_string(np_image, config='--psm 6')
+          full_text += page_text + '\n|\n'
+    result['text_length'] = len(full_text)
 
     if result['text_length'] == 0:
       logger.warning(f"File '{file_path}': Extracted text is empty for file: {file_path}")
       raise ValueError("Extracted text is empty")
     
-    summary_result = analyzer.summarize(document_text, file_path)
-    if summary_result.startswith("Key Info: {}"):
-      result['error_message'] = summary_result.split('\nSummary: ', 1)[1]
-      result['status'] = 'error'
-      return result
-    
-    key_info_str, abstractive_summary = summary_result.split('\nSummary: ', 1)
-    key_info = eval(key_info_str.replace("Key Info: ", ""))
+    result['category'] = classifier.predict(np.image, full_text)
+    probabilities = classifier.predictProba(np_image, full_text)
+    result['confidence'] = probabilities.get(result['category'], 0.0)
 
-    result['summary'] = abstractive_summary
-    result['key_info'] = key_info
-
-    if abstractive_summary:
-      category, confidence = analyzer.classify(abstractive_summary, labels, file_path)
-      result.update({
-        'category': category,
-        'confidence': confidence,
-        'status': 'success' if category and confidence else 'partial success'
-      })
-    else:
-      result['status'] = 'partial success'
-      logger.warning(f"File '{file_path}': Empty abstractive summary, classification skipped")
-
+    result['status'] = 'success'
     logger.info(f"File '{file_path}': Processing complete (Status: {result["status"]})")
 
   except Exception as e:
@@ -363,10 +425,10 @@ def processDocument(args):
   return result
 
 # Process the batches
-def processBatch(batch, analyzer, labels):
+def processBatch(batch, classifier, fax_detector):
   results = []
   with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
-    future_to_file = {executor.submit(processDocument, (file_path, analyzer, labels)): file_path for file_path in batch}
+    future_to_file = {executor.submit(processDocument, (file_path, classifier, fax_detector)): file_path for file_path in batch}
     for future in as_completed(future_to_file):
       result = future.result()
       results.append(result)
