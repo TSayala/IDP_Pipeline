@@ -12,17 +12,21 @@ import spacy
 from spacy.language import Language
 from spacy.tokens import Doc, Span
 from collections import Counter
+from typing import List, Tuple
+import unicodedata
 
 import numpy as np
 from PIL import Image, UnidentifiedImageError
 import pytesseract
 import cv2
 
+from sentence_transformers import SentenceTransformer, util
 from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
 
-from tqdm.notebook import tqdm
+#from tqdm.notebook import tqdm
 import pandas as pd
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -109,21 +113,199 @@ class DocumentLayoutAnalyzer:
       logger.error(f"Error predicting layout: {type(e).__name__} - {str(e)}")
       return None
 
-class FaxCoverDetector:
+class TextCleaner:
   def __init__(self):
-    self.keywords = ['fax', 'cover', 'sheet']
+    self.common_errors = {
+      'l': 'i',
+      '0': 'o',
+      '1': 'i',
+      '5': 's',
+      '8': 'b',
+      '9': 'g',
+      '|': 'i',
+      '—': '-',
+    }
 
-  def isFaxCover(self, image):
+  def clean(self, text: str) -> str:
+    """
+    Main method to clean the input text using a series of cleaning steps.
+    """
+    #text = self.removeNonPrintableChars(text)
+    text = self.removeSpecialChars(text)
+    text = self.removeHeaderFooter(text)
+    text = self.fixLineBreaks(text)
+    text = self.removeExtraWhitespace(text)
+    #text = self.correctCommonErrors(text)
+    #text = self.normalizeUnicode(text)
+    #text = self.correctWordSplits(text)
+    return text
+    
+  def removeNonPrintableChars(self, text: str) -> str:
+    """
+    Remove non-printable characters from the input text.
+    """
+    return ''.join(ch for ch in text if ch.isprintable())
+  
+  def fixLineBreaks(self, text: str) -> str:
+    """
+    Fix inconsistent line breaks and remove unnecessary ones.
+    """
+    lines = text.splitlines()
+    fixed_lines = []
+    for line in lines:
+      if line.strip():
+        fixed_lines.append(line.strip())
+    return ' '.join(fixed_lines)
+  
+  def removeExtraWhitespace(self, text: str) -> str:
+    """
+    Remove extra whitespace characters from the input text.
+    """
+    return ' '.join(text.split())
+  
+  def correctCommonErrors(self, text: str) -> str:
+    """
+    Correct common OCR misrecognition errors.
+    """
+    for error, correction in self.common_errors.items():
+      text = text.replace(error, correction)
+    return text
+  
+  def removeSpecialChars(self, text: str) -> str:
+    """
+    Remove special characters from the input text while keeping basic punctuation.
+    """
+    return re.sub(r'[^a-zA-Z0-9\s.,!?/-]', '', text)
+  
+  def normalizeUnicode(self, text: str) -> str:
+    """
+    Normalize Unicode characters to their closest ASCII equivalents.
+    """
+    return unicodedata.normalize('NFKD', text).encode('ASCII', 'ignore').decode('ASCII')
+  
+  def spellCheck(self, text: str) -> str:
+    """
+    [UNIMPLEMENTED] Perform spell checking on the input text.
+    """
+    return text
+  
+  def correctWordSplits(self, text: str) -> str:
+    """
+    Correct words that have been split incorrectly by OCR.
+    """
+    return re.sub(r'(\w+)-\s*\n\s*(\w+)', r'\1\2', text)
+  
+  def isHeaderFooter(self, line: str) -> bool:
+    """
+    Helper method to identify potential header and footer text.
+    """
+    return bool(re.match(r'(page \d+/\d+|[ivxlcdm]+)', line.strip().lower()))
+  
+  def removeHeaderFooter(self, text: str) -> str:
+    """
+    Remove header and footer text from the input text.
+    """
+    lines = text.splitlines()
+    cleaned_lines = [line for line in lines if not self.isHeaderFooter(line)]
+    return '\n'.join(cleaned_lines)
+  
+class FewShotDocumentProcessor:
+  def __init__(self, model_name='all-MiniLM-L6-v2'):
+    self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    self.model = SentenceTransformer(model_name).to(self.device)
+    self.few_shot_examples = None
+    self.few_shot_embeddings = None
+    self.few_shot_layouts = None
+    self.scaler = StandardScaler()
+    self.text_weight = 0.7
+    self.layout_weight = 1.0 - self.text_weight
+
+  def extractFeatures(self, image_path):
     try:
-      gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-      text = pytesseract.image_to_string(gray).lower()
-      keyword_count = sum(1 for keyword in self.keywords if keyword in text)
-      return keyword_count > len(self.keywords) / 2
+      # extract text using OCR
+      text, pages = readTifFile(image_path)
+
+      # extract layout features
+      layout_features_list = []
+      for page in pages:
+        gray = cv2.cvtColor(page, cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+        lines = cv2.HoughLinesP(edges, 1, np.pi/180, 100, minLineLength=100, maxLineGap=10)
+
+        if lines is not None:
+          horizontal_lines = sum(1 for line in lines if abs(line[0][1] - line[0][3]) < 5)
+          vertical_lines = sum(1 for line in lines if abs(line[0][0] - line[0][2]) < 5)
+        else:
+          horizontal_lines, vertical_lines = 0, 0
+        layout_features = np.array([
+          horizontal_lines,
+          vertical_lines,
+          cv2.countNonZero(edges),
+          len(pytesseract.image_to_boxes(Image.fromarray(page)).splitlines())
+        ])
+        layout_features_list.append(layout_features)
+      combined_layout_features = np.mean(layout_features_list, axis=0)
+      return text, combined_layout_features.reshape(1, -1)
+    
     except Exception as e:
-      logger.error(f"Error detecting fax cover: {type(e).__name__} - {str(e)}")
-      return False
+      logger.error(f"Error extracting features: {type(e).__name__} - {str(e)}")
+      return None, None
 
+  def loadFewShotExamples(self, csv_path):
+    try:
+      df = pd.read_csv(csv_path)
+      self.few_shot_examples = df.to_dict('records')
+      texts = []
+      layouts = []
 
+      for example in self.few_shot_examples:
+        text, layout = self.extractFeatures(example['file_path'])
+        texts.append(text)
+        layouts.append(layout)
+
+      self.few_shot_embeddings = self.model.encode(texts, convert_to_tensor=True)
+      self.few_shot_layouts = np.vstack(layouts)
+      self.scaler.fit(self.few_shot_layouts)
+
+    except Exception as e:
+      logger.error(f"Error loading few-shot examples: {type(e).__name__} - {str(e)}")
+
+  def predict(self, image_path):
+    text, layout = self.extractFeatures(image_path)
+    query_embedding = self.model.encode(text, convert_to_tensor=True)
+    layout = self.scaler.transform(layout)
+
+    text_scores = util.cos_sim(query_embedding, self.few_shot_embeddings)[0]
+
+    layout_distances = np.linalg.norm(self.few_shot_layouts - layout, axis=1)
+    layout_scores = 1 / (1 + layout_distances)
+
+    combined_scores = self.text_weight * text_scores + self.layout_weight * torch.tensor(layout_scores, device=self.device)
+
+    top_result = torch.argmax(combined_scores)
+    return self.few_shot_examples[top_result]['category']
+  
+  def predictProba(self, image_path):
+    text, layout = self.extractFeatures(image_path)
+    query_embedding = self.model.encode(text, convert_to_tensor=True)
+    layout = self.scaler.transform(layout)
+
+    text_scores = util.cos_sim(query_embedding, self.few_shot_embeddings)[0]
+    layout_distances = np.linalg.norm(self.few_shot_layouts - layout, axis=1)
+    layout_scores = 1 / (1 + layout_distances)
+
+    combined_scores = self.text_weight * text_scores + self.layout_weight * torch.tensor(layout_scores, device=self.device)
+    probabilities = torch.softmax(combined_scores, dim=0)
+
+    category_probs = {}
+    for i, example in enumerate(self.few_shot_examples):
+      category = example['category']
+      if category not in category_probs:
+        category_probs[category] = probabilities[i].item()
+      else:
+        category_probs[category] = max(category_probs[category], probabilities[i].item())
+
+    return category_probs
 
 class UnsupervisedDocumentAnalyzer:
 
@@ -352,18 +534,50 @@ class UnsupervisedDocumentAnalyzer:
     if category is None or confidence is None:
       return summary, None, None
     return summary, category, confidence
-  
+
+def isFaxCover(text: str) -> Tuple[bool, List[str]]:
+  keywords = ['fax', 'cover', 'sheet', 'attached']
+  text = text.lower()
+  matched_keywords = []
+  keyword_count = 0
+  for keyword in keywords:
+    count = text.count(keyword)
+    if count > 0:
+      matched_keywords.append(keyword)
+      keyword_count += count
+    
+    return keyword_count >= 2, matched_keywords
+      
 # Read the TIF file and extract text using OCR  
-def readTifFile(file_path):
+def readTifFile(file_path: str) -> Tuple[str, List[np.ndarray]]:
+  """
+  Reads a TIF file and extracts text from it using OCR.
+  Iterates by page and returns cleaned text and images for each page if a fax cover page is not detected.
+
+  returns:
+  Tuple[str, List[np.ndarray]]: A tuple containing the cleaned text and a list of images.
+  """
+  cleaner = TextCleaner()
   try:
     with Image.open(file_path) as img:
       pages = []
+      texts = []
       for i in range(img.n_frames):
         img.seek(i)
-        page = np.array(img)
-        text = pytesseract.image_to_string(page)
-        pages.append(text)
-    return " ".join(pages)
+        rgb_image = img.convert('RGB')
+        np_image = np.array(rgb_image)
+        text = pytesseract.image_to_string(np_image)
+        text = cleaner.clean(text)
+        if i == 0:
+          is_fax_cover, matched_keywords = isFaxCover(text)
+          if is_fax_cover:
+            logger.info(f"File '{file_path}': Detected a fax cover page. Keywords: {matched_keywords}")
+          else:
+            texts.append(text)
+            pages.append(np_image)
+        texts.append(text)
+        pages.append(np_image)
+    return " ".join(texts), pages
   except UnidentifiedImageError:
     logger.error(f"File '{file_path}': Not a valid image file or is corrupted")
     raise
@@ -374,7 +588,6 @@ def readTifFile(file_path):
     logger.error(f"File '{file_path}': Unexpected error reading file: {str(e)}")
     raise
 
-# Process the document
 def processDocument(args):
   file_path, classifier, fax_detector = args
 
@@ -384,13 +597,13 @@ def processDocument(args):
     'confidence': None,
     'status': 'error',
     'error_message': None,
-    'text_length': 0,
     'is_fax_cover': False,
-    'num_pages': 0
+    'text_length': 0
   }
 
   try:
     logger.info(f"Processing document {file_path}")
+    # result['is_fax_cover'] = fax_detector.isFaxCover(file_path)
     with Image.open(file_path) as img:
       result['num_pages'] = img.n_frames
       full_text = ""
@@ -411,8 +624,8 @@ def processDocument(args):
       logger.warning(f"File '{file_path}': Extracted text is empty for file: {file_path}")
       raise ValueError("Extracted text is empty")
     
-    result['category'] = classifier.predict(np.image, full_text)
-    probabilities = classifier.predictProba(np_image, full_text)
+    result['category'] = classifier.predict(file_path)
+    probabilities = classifier.predictProba(file_path)
     result['confidence'] = probabilities.get(result['category'], 0.0)
 
     result['status'] = 'success'
@@ -441,14 +654,18 @@ def batchGenerator(file_paths, batch_size):
     yield file_paths[i:i+batch_size]
 
 # Process all the documents in the corpus
-def processAllDocuments(file_paths, analyzer, labels, batch_size=30):
+def processAllDocuments(file_paths, examples, batch_size=30):
+  analyzer = FewShotDocumentProcessor()
+  analyzer.loadFewShotExamples(examples)
+  fax_detector = FaxCoverDetector()
+
   all_results = []
   total_batches = len(file_paths) // batch_size + (1 if len(file_paths) % batch_size else 0)
 
   logger.info(f'Starting to process {len(file_paths)} documents in {total_batches} batches')
   for i, batch in enumerate(batchGenerator(file_paths, batch_size), 1):
     logger.info(f'Processing batch {i}/{total_batches}')
-    batch_results = processBatch(batch, analyzer, labels)
+    batch_results = processBatch(batch, analyzer, fax_detector)
     all_results.extend(batch_results)
     logger.info(f'Completed batch {i}/{total_batches}')
 
