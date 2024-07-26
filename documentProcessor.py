@@ -4,6 +4,7 @@ import os
 import re
 import io
 import string
+import json
 
 import nltk
 nltk.download('stopwords')
@@ -589,7 +590,7 @@ def readTifFile(file_path: str) -> Tuple[str, List[np.ndarray]]:
     raise
 
 def processDocument(args):
-  file_path, classifier, fax_detector = args
+  file_path, classifier = args
 
   result = {
     'file_path': file_path,
@@ -598,30 +599,19 @@ def processDocument(args):
     'status': 'error',
     'error_message': None,
     'is_fax_cover': False,
-    'text_length': 0
+    'text_length': 0,
+    'num_pages': 0
   }
 
   try:
     logger.info(f"Processing document {file_path}")
-    # result['is_fax_cover'] = fax_detector.isFaxCover(file_path)
-    with Image.open(file_path) as img:
-      result['num_pages'] = img.n_frames
-      full_text = ""
-      for i in range(img.n_frames):
-        img.seek(i)
-        np_image = np.array(img)
-        if i == 0:
-          result['is_fax_cover'] = fax_detector.isFaxCover(np_image)
-          if result['is_fax_cover']:
-            logger.info(f"File '{file_path}': Detected a fax cover page.")
-            result['status'] = 'skipped'
-            return result
-          page_text = pytesseract.image_to_string(np_image, config='--psm 6')
-          full_text += page_text + '\n|\n'
+    full_text, pages = readTifFile(file_path)
+
     result['text_length'] = len(full_text)
+    result['num_pages'] = len(pages)
 
     if result['text_length'] == 0:
-      logger.warning(f"File '{file_path}': Extracted text is empty for file: {file_path}")
+      logger.warning(f"File '{file_path}': Extracted text is empty")
       raise ValueError("Extracted text is empty")
     
     result['category'] = classifier.predict(file_path)
@@ -638,10 +628,10 @@ def processDocument(args):
   return result
 
 # Process the batches
-def processBatch(batch, classifier, fax_detector):
+def processBatch(batch, classifier):
   results = []
   with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
-    future_to_file = {executor.submit(processDocument, (file_path, classifier, fax_detector)): file_path for file_path in batch}
+    future_to_file = {executor.submit(processDocument, (file_path, classifier)): file_path for file_path in batch}
     for future in as_completed(future_to_file):
       result = future.result()
       results.append(result)
@@ -657,7 +647,6 @@ def batchGenerator(file_paths, batch_size):
 def processAllDocuments(file_paths, examples, batch_size=30):
   analyzer = FewShotDocumentProcessor()
   analyzer.loadFewShotExamples(examples)
-  fax_detector = FaxCoverDetector()
 
   all_results = []
   total_batches = len(file_paths) // batch_size + (1 if len(file_paths) % batch_size else 0)
@@ -665,7 +654,7 @@ def processAllDocuments(file_paths, examples, batch_size=30):
   logger.info(f'Starting to process {len(file_paths)} documents in {total_batches} batches')
   for i, batch in enumerate(batchGenerator(file_paths, batch_size), 1):
     logger.info(f'Processing batch {i}/{total_batches}')
-    batch_results = processBatch(batch, analyzer, fax_detector)
+    batch_results = processBatch(batch, analyzer)
     all_results.extend(batch_results)
     logger.info(f'Completed batch {i}/{total_batches}')
 
