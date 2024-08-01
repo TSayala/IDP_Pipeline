@@ -8,6 +8,7 @@ import pickle
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -21,13 +22,15 @@ import pytesseract
 import cv2
 
 from sentence_transformers import SentenceTransformer, util
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
 
 from modAL.models import ActiveLearner
 from modAL.uncertainty import uncertainty_sampling
+
+from transformers import BertTokenizer, BertModel
 
 import pandas as pd
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -392,6 +395,92 @@ def activeLearningLoop(active_learner, unlabeled_data, batch_size=10):
 
   return active_learner
 
+def getBertEmbeddings(text, max_length=512):
+  tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+  model = BertModel.from_pretrained('bert-base-uncased')
+
+  inputs = tokenizer(text, return_tensors='pt', max_length=max_length, truncation=True, padding=True)
+  with torch.no_grad():
+    outputs = model(**inputs)
+  return outputs.last_hidden_state[:, 0, :].numpy()
+
+def extractLayoutFeatures(image):
+  gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+  edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+  lines = cv2.HoughLinesP(edges, 1, np.pi/180, 100, minLineLength=100, maxLineGap=10)
+  horizontal_lines = 0
+  vertical_lines = 0
+  if lines is not None:
+    for line in lines:
+      x1, y1, x2, y2 = line[0]
+      if abs(y2 - y1) < 5:
+        horizontal_lines += 1
+      elif abs(x2 - x1) < 5:
+        vertical_lines += 1
+
+  _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+  kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+  dilated = cv2.dilate(thresh, kernel, iterations=1)
+  contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+  text_regions = len(contours)
+  white_space_ratio = 1 - (cv2.countNonZero(thresh) / (image.shape[0] * image.shape[1]))
+  return np.array([horizontal_lines, vertical_lines, text_regions, white_space_ratio])
+
+class CNNLSTM(nn.Module):
+  def __init__(self, num_layout_features, text_embedding_dim, hidden_dim, num_classes):
+    super(CNNLSTM, self).__init__()
+    self.conv1 = nn.Conv1d(1, 32, kernel_size=3, padding=1)
+    self.conv2 = nn.Conv1d(32, 64, kernel_size=3, padding=1)
+    self.pool = nn.MaxPool1d(kernel_size=2)
+    self.fc1 = nn.Linear(64 * (num_layout_features // 2), hidden_dim)
+
+    self.lstm = nn.LSTM(text_embedding_dim, hidden_dim, batch_first=True)
+    self.fc2 = nn.Linear(hidden_dim * 2, num_classes)
+
+  def forward(self, layout_features, text_embeddings):
+    x_layout = layout_features.unsqueeze(1)
+    x_layout = self.pool(F.relu(self.conv1(x_layout)))
+    x_layout = self.pool(F.relu(self.conv2(x_layout)))
+    x_layout = x_layout.view(x_layout.size(0), -1)
+    x_layout = F.relu(self.fc1(x_layout))
+
+    _, (h_n, _) = self.lstm(text_embeddings)
+    x_text = h_n.squeeze(0)
+
+    x_combined = torch.cat((x_layout, x_text), dim=1)
+    output = self.fc2(x_combined)
+    return output
+  
+def trainCNNLSTM(model, train_loader, val_loader, num_epochs, learning_rate):
+  criterion = nn.CrossEntropyLoss()
+  optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+  for epoch in range(num_epochs):
+    model.train()
+    for layout_features, text_embeddings, labels in train_loader:
+      optimizer.zero_grad()
+      outputs = model(layout_features, text_embeddings)
+      loss = criterion(outputs, labels)
+      loss.backward()
+      optimizer.step()
+
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+      for layout_features, text_embeddings, labels in val_loader:
+        outputs = model(layout_features, text_embeddings)
+        _, predicted = torch.max(outputs.data, 1)
+        total += labels.size(0)
+        correct += (predicted == labels).sum().item()
+
+    accuracy = 100 * correct / total
+    logger.info(f'Epoch {epoch+1}/{num_epochs}, Accuracy: {accuracy:.2f}%')
+
+  return model
+
+
 class SimpleNN(nn.Module):
   def __init__(self, input_size, hidden_size, num_classes):
     super(SimpleNN, self).__init__()
@@ -463,7 +552,33 @@ class NeuralNetValidator:
       probabilities = torch.softmax(outputs, dim=1)
       predicted = torch.argmax(probabilities, dim=1)
     return predicted.cpu().numpy(), probabilities.cpu().numpy()
+
+class VotingClassifier:
+  def __init__(self, threshold=0.6):
+    self.threshold = threshold
+
+  def combinePredictions(self, few_shot_pred, al_pred, nn_pred, few_shot_conf, al_conf, nn_conf):
+    predictions = [few_shot_pred, al_pred, nn_pred]
+    confidences = [few_shot_conf, al_conf, nn_conf]
+
+    if len(set(predictions)) == 1:
+      return predictions[0], max(confidences)
+    
+    for pred in predictions:
+      if predictions.count(pred) >= 2:
+        conf = max([conf for p, conf in zip(predictions, confidences) if p == pred])
+        if conf >= self.threshold:
+          return pred, conf
+        
+    max_conf_index = confidences.index(max(confidences))
+    return predictions[max_conf_index], confidences[max_conf_index]
   
+def applyVoting(row, voter):
+  return voter.combinePredictions(
+    row['category'], row['al_category'], row['nn_category'],
+    row['confidence'], row['al_confidence'], row['nn_confidence']
+  )
+
 def prepareDataForNeuralNet(df):
   features = df[['confidence', 'text_length', 'num_pages']].values
   labels = pd.factorize(df['category'])[0]
@@ -606,6 +721,9 @@ def processAllDocuments(file_paths, examples, batch_size=30, force_reload=False)
   nn_predictions, nn_probas = nn_validator.validate(nn_features)
   df['nn_category'] = nn_predictions
   df['nn_confidence'] = np.max(nn_probas, axis=1)
+
+  voter = VotingClassifier(threshold=0.6)
+  df['voted_category'], df['voted_confidence'] = df.apply(lambda row: pd.Series(applyVoting(row, voter)), axis=1)
 
   """ logger.info(f'Starting to validate {len(df)} documents')
   validator = PostClassificationValidator()
