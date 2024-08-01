@@ -1,15 +1,34 @@
-import torch
 import psutil
 import os
 import re
-import spacy
+import io
+import string
+import json
+import pickle
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+
+from collections import Counter
+from typing import List, Tuple
+import unicodedata
+
 import numpy as np
 from PIL import Image, UnidentifiedImageError
 import pytesseract
-from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.cluster import KMeans
-from tqdm.notebook import tqdm
+import cv2
+
+from sentence_transformers import SentenceTransformer, util
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
+
+from modAL.models import ActiveLearner
+from modAL.uncertainty import uncertainty_sampling
+
 import pandas as pd
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import logging
@@ -38,125 +57,431 @@ def setupLogger(log_file='document_processor.log'):
   logger.addHandler(console_handler)
 
   return logger
-
 _logger = setupLogger()
-
 def getLogger():
   global _logger
   return _logger
-
 logger = getLogger()
 
-class UnsupervisedDocumentAnalyzer:
-
-  # Initialize the model
-  def __init__(self, model_name='facebook/bart-large-mnli'):
-    self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-    self.model = AutoModelForSequenceClassification.from_pretrained(model_name).to(self.device)
-    self.classifier = pipeline('zero-shot-classification', model=self.model, tokenizer=self.tokenizer, device=0 if self.device == 'cuda' else -1)
-    self.summarizer = pipeline('summarization', model='facebook/bart-large-cnn', device=0 if self.device == 'cuda' else -1)
-    self.nlp = spacy.load('en_core_web_sm')
-    self.vectorizer = TfidfVectorizer(max_features=1000)
-    self.kmeans = KMeans(n_clusters=15, random_state=42)
-    self.max_chunk_length = 1024
-
-  def cleanText(self, text):
-    cleaned = re.sub(r'©.*?AM', '', text)
-    cleaned = re.sub(r'~.*?of \d', '', cleaned) # Remove page numbers
-    cleaned = re.sub(r'\n+', '\n', cleaned) # Replace multiple newlines with single newline
-    cleaned = re.sub(r'\s+', ' ', cleaned) # Replace multiple spaces with single space
-    cleaned = re.sub(r'In(?=\w)', '\n', cleaned) # Add newline after 'In' at the start of a sentence
-    cleaned = re.sub(r'(?<=\w)In', '\n', cleaned) # Add newline before 'In' at the end of a sentence
-
-    cleaned = re.sub(r'[^\w\s\.\,\:\-\(\)]', '', cleaned) # Remove special characters except .,:-()
-
-    lines = [line.strip() for line in cleaned.split('\n') if line.strip()]
-    return '\n'.join(lines)
-    
-
-  # Extract key information from the text
-  def extractKeyInfo(self, text):
-
-    patterns = {
-      'Date': r'\d{2}-\d{2}-\d{4}', # DD-MM-YYYY
-      'Patient': r'Patient:\s*([\w\s]+)',
-      'DOB': r'Date of Birth:\s*([\d\-]+)',
+class TextCleaner:
+  def __init__(self):
+    self.common_errors = {
+      'l': 'i',
+      '0': 'o',
+      '1': 'i',
+      '5': 's',
+      '8': 'b',
+      '9': 'g',
+      '|': 'i',
+      '—': '-',
     }
+
+  def clean(self, text: str) -> str:
+    """
+    Main method to clean the input text using a series of cleaning steps.
+    """
+    #text = self.removeNonPrintableChars(text)
+    text = self.removeSpecialChars(text)
+    text = self.removeHeaderFooter(text)
+    text = self.fixLineBreaks(text)
+    text = self.removeExtraWhitespace(text)
+    #text = self.correctCommonErrors(text)
+    #text = self.normalizeUnicode(text)
+    #text = self.correctWordSplits(text)
+    return text
     
-    """ date_pattern = r'\d{2}-\d{2}-\d{4}' # DD-MM-YYYY
-    phone_pattern = r'\d{3}-\d{3}-\d{4}' # 123-456-7890
-    name_pattern = r'(?:From:|Comment:)\s*([\w\s]+)'
-
-    date = re.search(date_pattern, text)
-    phone = re.search(phone_pattern, text)
-    name = re.search(name_pattern, text) """
-
-    key_info = []
-    for key, pattern in patterns.items():
-      match = re.search(pattern, text, re.DOTALL)
-      if match:
-        key_info[key] = match.group(1).strip()
-
-    return key_info
+  def removeNonPrintableChars(self, text: str) -> str:
+    """
+    Remove non-printable characters from the input text.
+    """
+    return ''.join(ch for ch in text if ch.isprintable())
   
-  # Extract the main content from the text
-  def extractMainContent(self, text):
-    doc = self.nlp(text)
-    content_sentences = [sent.text for sent in doc.sents if len(sent) > 5 and not sent.text.isupper()]
-    return " ".join(content_sentences)
+  def fixLineBreaks(self, text: str) -> str:
+    """
+    Fix inconsistent line breaks and remove unnecessary ones.
+    """
+    lines = text.splitlines()
+    fixed_lines = []
+    for line in lines:
+      if line.strip():
+        fixed_lines.append(line.strip())
+    return ' '.join(fixed_lines)
   
-  # Summarize the text
-  def summarize(self, text, file_name):
+  def removeExtraWhitespace(self, text: str) -> str:
+    """
+    Remove extra whitespace characters from the input text.
+    """
+    return ' '.join(text.split())
+  
+  def correctCommonErrors(self, text: str) -> str:
+    """
+    Correct common OCR misrecognition errors.
+    """
+    for error, correction in self.common_errors.items():
+      text = text.replace(error, correction)
+    return text
+  
+  def removeSpecialChars(self, text: str) -> str:
+    """
+    Remove special characters from the input text while keeping basic punctuation.
+    """
+    return re.sub(r'[^a-zA-Z0-9\s.,!?/-]', '', text)
+  
+  def normalizeUnicode(self, text: str) -> str:
+    """
+    Normalize Unicode characters to their closest ASCII equivalents.
+    """
+    return unicodedata.normalize('NFKD', text).encode('ASCII', 'ignore').decode('ASCII')
+  
+  def spellCheck(self, text: str) -> str:
+    """
+    [UNIMPLEMENTED] Perform spell checking on the input text.
+    """
+    return text
+  
+  def correctWordSplits(self, text: str) -> str:
+    """
+    Correct words that have been split incorrectly by OCR.
+    """
+    return re.sub(r'(\w+)-\s*\n\s*(\w+)', r'\1\2', text)
+  
+  def isHeaderFooter(self, line: str) -> bool:
+    """
+    Helper method to identify potential header and footer text.
+    """
+    return bool(re.match(r'(page \d+/\d+|[ivxlcdm]+)', line.strip().lower()))
+  
+  def removeHeaderFooter(self, text: str) -> str:
+    """
+    Remove header and footer text from the input text.
+    """
+    lines = text.splitlines()
+    cleaned_lines = [line for line in lines if not self.isHeaderFooter(line)]
+    return '\n'.join(cleaned_lines)
+  
+class FewShotDocumentProcessor:
+  def __init__(self, model_name='all-MiniLM-L6-v2', cache=None):
+    self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    self.model = SentenceTransformer(model_name).to(self.device)
+    self.cache = cache if cache else FewShotCache()
+    self.text_weight = 0.7
+    self.layout_weight = 1.0 - self.text_weight
+    self.threshold = 0.1
+
+  def loadFewShotExamples(self, csv_path, force_reload=False):
+    if not force_reload and self.cache.load():
+      logger.info("Few-shot examples loaded from cache")
+      self.few_shot_examples = self.cache.few_shot_examples
+      self.few_shot_embeddings = self.cache.few_shot_embeddings
+      self.few_shot_layouts = self.cache.few_shot_layouts
+      self.scaler = self.cache.scaler
+    else:
+      logger.info("Few-shot examples not found in cache. Loading from CSV file")
+      try:
+        df = pd.read_csv(csv_path)
+        self.few_shot_examples = df.to_dict('records')
+        texts = []
+        layouts = []
+
+        for example in self.few_shot_examples:
+          text, layout = self.extractFeatures(example['file_path'])
+          texts.append(text)
+          layouts.append(layout)
+
+        self.few_shot_embeddings = self.model.encode(texts, convert_to_tensor=True)
+        self.few_shot_layouts = np.vstack(layouts)
+        self.scaler = StandardScaler()
+        self.scaler.fit(self.few_shot_layouts)
+
+        self.cache.few_shot_examples = self.few_shot_examples
+        self.cache.few_shot_embeddings = self.few_shot_embeddings
+        self.cache.few_shot_layouts = self.few_shot_layouts
+        self.cache.scaler = self.scaler
+        self.cache.save()
+        logger.info("Saved few-shot examples to cache")
+
+      except Exception as e:
+        logger.error(f"Error loading few-shot examples: {type(e).__name__} - {str(e)}")
+
+  def extractFeatures(self, image_path):
     try:
-      logger.debug(f"File '{file_name}': Attempting to clean and summarize text of length {len(text)} characters")
+      # extract text using OCR
+      text, pages = readTifFile(image_path)
 
-      cleaned_text = self.cleanText(text)
+      # extract layout features
+      layout_features_list = []
+      for page in pages:
+        gray = cv2.cvtColor(page, cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+        lines = cv2.HoughLinesP(edges, 1, np.pi/180, 100, minLineLength=100, maxLineGap=10)
 
-      key_info = self.extractKeyInfo(cleaned_text)
-      main_content = self.extractMainContent(cleaned_text)
-
-      if len(main_content.split()) < 30:
-        logger.warning(f"File '{file_name}': Text too short for summarization: {len(main_content.split())} words")
-        return f"{key_info}\nContent: {main_content}"
-      
-      summary = self.summarizer(main_content, max_length=150, min_length=30, do_sample=False)[0]['summary_text']
-      final_summary = f"Key Info: {key_info}\nSummary: {summary}"   
-
-      logger.debug(f"File '{file_name}': Summary successful. Final summary length: {len(final_summary)} characters")
-      return final_summary
+        if lines is not None:
+          horizontal_lines = sum(1 for line in lines if abs(line[0][1] - line[0][3]) < 5)
+          vertical_lines = sum(1 for line in lines if abs(line[0][0] - line[0][2]) < 5)
+        else:
+          horizontal_lines, vertical_lines = 0, 0
+        layout_features = np.array([
+          horizontal_lines,
+          vertical_lines,
+          cv2.countNonZero(edges),
+          len(pytesseract.image_to_boxes(Image.fromarray(page)).splitlines())
+        ])
+        layout_features_list.append(layout_features)
+      combined_layout_features = np.mean(layout_features_list, axis=0)
+      return text, combined_layout_features.reshape(1, -1)
     
     except Exception as e:
-      logger.error(f"File '{file_name}': Error in summarization: {str(e)}")
-      return text[:512] + '... (truncated)' if len(text) > 512 else text
-  
-  # Classify the text
-  def classify(self, text, labels, file_name):
-    try:
-      logger.debug(f"File '{file_name}': Attempting to classify text of length {len(text)} with {len(labels)} labels")
-      result = self.classifier(text, labels)
-      logger.debug(f"File '{file_name}': Classification successful. Top label: {result['labels'][0]}, Confidence: {result['scores'][0]}")
-      return result['labels'][0], result['scores'][0]
-    except Exception as e:
-      logger.error(f"File '{file_name}': Error in classification: {str(e)}")
+      logger.error(f"Error extracting features: {type(e).__name__} - {str(e)}")
       return None, None
+
+  def predict(self, image_path):
+    text, layout = self.extractFeatures(image_path)
+    query_embedding = self.model.encode(text, convert_to_tensor=True)
+    layout = self.scaler.transform(layout)
+
+    text_scores = util.cos_sim(query_embedding, self.few_shot_embeddings)[0]
+    layout_distances = np.linalg.norm(self.few_shot_layouts - layout, axis=1)
+    layout_scores = 1 / (1 + layout_distances)
+
+    combined_scores = self.text_weight * text_scores + self.layout_weight * torch.tensor(layout_scores, device=self.device)
+
+    top_k = 3
+    top_indices = torch.topk(combined_scores, k=top_k).indices
+
+    categories = [self.few_shot_examples[i]['category'] for i in top_indices]
+    scores = combined_scores[top_indices].tolist()
+
+    total_score = sum(scores)
+    normalized_scores = [score / total_score for score in scores]
+
+    if normalized_scores[0] > self.threshold:
+      return categories[0], normalized_scores[0]
+    else:
+      return 'Uncertain', normalized_scores[0]
+    #top_result = torch.argmax(combined_scores)
+    #return self.few_shot_examples[top_result]['category']
   
-  # Cluster the documents
-  def cluster(self, documents):
-    vectors = self.vectorizer.fit_transform(documents)
-    clusters = self.kmeans.fit_predict(vectors)
-    return clusters
+  def predictProba(self, image_path):
+    text, layout = self.extractFeatures(image_path)
+    query_embedding = self.model.encode(text, convert_to_tensor=True)
+    layout = self.scaler.transform(layout)
+
+    text_scores = util.cos_sim(query_embedding, self.few_shot_embeddings)[0]
+    layout_distances = np.linalg.norm(self.few_shot_layouts - layout, axis=1)
+    layout_scores = 1 / (1 + layout_distances)
+
+    combined_scores = self.text_weight * text_scores + self.layout_weight * torch.tensor(layout_scores, device=self.device)
+    probabilities = torch.softmax(combined_scores, dim=0)
+
+    category_probs = {}
+    for i, example in enumerate(self.few_shot_examples):
+      category = example['category']
+      if category not in category_probs:
+        category_probs[category] = probabilities[i].item()
+      else:
+        category_probs[category] = max(category_probs[category], probabilities[i].item())
+
+    return category_probs
+
+class FewShotCache:
+  def __init__(self, cache_file='data/examples/cache/few_shot_cache.pkl'):
+    self.cache_file = cache_file
+    self.few_shot_examples = None
+    self.few_shot_embeddings = None
+    self.few_shot_layouts = None
+    self.scaler = None
+
+  def save(self):
+    with open(self.cache_file, 'wb') as f:
+      pickle.dump({
+        'few_shot_examples': self.few_shot_examples,
+        'few_shot_embeddings': self.few_shot_embeddings,
+        'few_shot_layouts': self.few_shot_layouts,
+        'scaler': self.scaler
+      }, f)
+
+  def load(self):
+    if os.path.exists(self.cache_file):
+      with open(self.cache_file, 'rb') as f:
+        data = pickle.load(f)
+        self.few_shot_examples = data.get('few_shot_examples')
+        self.few_shot_embeddings = data.get('few_shot_embeddings')
+        self.few_shot_layouts = data.get('few_shot_layouts')
+        self.scaler = data.get('scaler')
+      return True
+    return False
   
-  # Analyze the document =
-  def analyzeDocument(self, text, labels):
-    summary = self.summarize(text)
-    if summary is None:
-      return None, None, None
-    category, confidence = self.classify(summary, labels)
-    if category is None or confidence is None:
-      return summary, None, None
-    return summary, category, confidence
+  def clear(self):
+    if os.path.exists(self.cache_file):
+      os.remove(self.cache_file)
+      logger.info(f"Cache file {self.cache_file} has been removed")
+    self.init()
+    logger.info("Cache has been cleared")
+
+class PostClassificationValidator:
+  def __init__(self):
+    self.classifier = RandomForestClassifier(n_estimators=100, random_state=42)
+    self.features = None
+    self.labels = None
+
+  def prepareData(self, df):
+    self.features = df[['confidence', 'text_length', 'num_pages']]
+    self.labels = df['category']
   
+  def train(self):
+    X_train, X_test, y_train, y_test = train_test_split(self.features, self.labels, test_size=0.2, random_state=42)
+    self.classifier.fit(X_train, y_train)
+    y_pred = self.classifier.predict(X_test)
+    print(classification_report(y_test, y_pred))
+
+  def validate(self, new_results):
+    features = new_results[['confidence', 'text_length', 'num_pages']]
+    validated_categories = self.classifier.predict(features)
+    validated_probas = self.classifier.predict_proba(features)
+
+    new_results['validated_category'] = validated_categories
+    new_results['validated_confidence'] = validated_probas.max(axis=1)
+    return new_results
+  
+  def saveModel(self, model_file='data/models/post_classifier.pkl'):
+    with open(model_file, 'wb') as f:
+      pickle.dump(self.classifier, f)
+
+  def loadModel(self, model_file='data/models/post_classifier.pkl'):
+    with open(model_file, 'rb') as f:
+      self.classifier = pickle.load(f)
+
+class ActiveLearner:
+  def __init__(self, initial_data, initial_labels):
+    self.classifier = RandomForestClassifier(n_estimators=100, random_state=42)
+    self.learner = ActiveLearner(
+      estimator=self.classifier,
+      X_training=initial_data,
+      y_training=initial_labels,
+      query_strategy=uncertainty_sampling      
+    )
+
+  def query(self, unlabeled_data, n_instances=1):
+    query_idx, query_instance = self.learner.query(unlabeled_data, n_instances=n_instances)
+    return query_idx, query_instance
+  
+  def teach(self, X, y):
+    self.learner.teach(X, y)
+
+  def predict(self, X):
+    return self.learner.predict(X)
+  
+  def predictProba(self, X):
+    return self.learner.predict_proba(X)
+  
+def prepareDataForActiveLearning(df):
+  features = df[['confidence', 'text_length', 'num_pages']].values
+  labels = df['category'].values
+  return features, labels
+
+def activeLearningLoop(active_learner, unlabeled_data, batch_size=10):
+  while len(unlabeled_data) > 0:
+    query_idx, query_instance = active_learner.query(unlabeled_data, n_instances=batch_size)
+    
+    # simulate labeling
+    human_labels = unlabeled_data['category'].iloc[query_idx].values
+
+    active_learner.teach(query_instance, human_labels)
+    unlabeled_data = unlabeled_data.drop(unlabeled_data.index[query_idx])
+    logger.info(f"Remaining unlabeled data: {len(unlabeled_data)}")
+
+  return active_learner
+
+class SimpleNN(nn.Module):
+  def __init__(self, input_size, hidden_size, num_classes):
+    super(SimpleNN, self).__init__()
+    self.fc1 = nn.Linear(input_size, hidden_size)
+    self.relu = nn.ReLU()
+    self.fc2 = nn.Linear(hidden_size, num_classes)
+  
+  def forward(self, x):
+    out = self.fc1(x)
+    out = self.relu(out)
+    out = self.fc2(out)
+    return out
+  
+class NeuralNetValidator:
+  def __init__(self, input_size, hidden_size, num_classes):
+    self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    self.model = SimpleNN(input_size, hidden_size, num_classes).to(self.device)
+    self.criterion = nn.CrossEntropyLoss()
+    self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+    self.scaler = StandardScaler()
+
+    def prepareData(self, features, labels):
+      X_scaled = self.scaler.fit_transform(features)
+      X_train, X_val, y_train, y_val = train_test_split(X_scaled, labels, test_size=0.2, random_state=42)
+
+      X_train_tensor = torch.FloatTensor(X_train).to(self.device)
+      y_train_tensor = torch.LongTensor(y_train).to(self.device)
+      X_val_tensor = torch.FloatTensor(X_val).to(self.device)
+      y_val_tensor = torch.LongTensor(y_val).to(self.device)
+
+      train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+      val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
+      return train_dataset, val_dataset
+    
+  def train(self, train_dataset, val_dataset, num_epochs=50, batch_size=32):
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+
+    for epoch in range(num_epochs):
+      self.model.train()
+      for batch_features, batch_labels in train_loader:
+        self.optimizer.zero_grad()
+        outputs = self.model(batch_features)
+        loss = self.criterion(outputs, batch_labels)
+        loss.backward()
+        self.optimizer.step()
+
+      # validation
+      self.model.eval()
+      val_loss = 0
+      correct = 0
+      total = 0
+      with torch.no_grad():
+        for batch_features, batch_labels in val_loader:
+          outputs = self.model(batch_features)
+          loss = self.criterion(outputs, batch_labels)
+          val_loss += loss.item()
+          _, predicted = torch.max(outputs.data, 1)
+          total += batch_labels.size(0)
+          correct += (predicted == batch_labels).sum().item()
+
+      logger.info(f'Epoch {epoch+1}/{num_epochs}, Loss: {val_loss/len(val_loader):.4f}, Accuracy: {100*correct/total:.2f}%')
+
+  def validate(self, features):
+    X_scaled = self.scaler.transform(features)
+    X_tensor = torch.FloatTensor(X_scaled).to(self.device)
+    with torch.no_grad():
+      outputs = self.model(X_tensor)
+      probabilities = torch.softmax(outputs, dim=1)
+      predicted = torch.argmax(probabilities, dim=1)
+    return predicted.cpu().numpy(), probabilities.cpu().numpy()
+  
+def prepareDataForNeuralNet(df):
+  features = df[['confidence', 'text_length', 'num_pages']].values
+  labels = pd.factorize(df['category'])[0]
+  return features, labels, len(set(labels))
+
+def isFaxCover(text: str) -> Tuple[bool, List[str]]:
+  keywords = ['fax', 'cover', 'sheet', 'attached']
+  text = text.lower()
+  matched_keywords = []
+  keyword_count = 0
+  for keyword in keywords:
+    count = text.count(keyword)
+    if count > 0:
+      matched_keywords.append(keyword)
+      keyword_count += count
+    
+    return keyword_count >= 2, matched_keywords
+      
 # Read the TIF file and extract text using OCR  
 def readTifFile(file_path):
   try:
@@ -240,7 +565,11 @@ def batchGenerator(file_paths, batch_size):
     yield file_paths[i:i+batch_size]
 
 # Process all the documents in the corpus
-def processAllDocuments(file_paths, analyzer, labels, batch_size=30):
+def processAllDocuments(file_paths, examples, batch_size=30, force_reload=False):
+  cache = FewShotCache()
+  analyzer = FewShotDocumentProcessor(cache=cache)
+  analyzer.loadFewShotExamples(examples, force_reload=force_reload)
+
   all_results = []
   total_batches = len(file_paths) // batch_size + (1 if len(file_paths) % batch_size else 0)
 
@@ -252,7 +581,39 @@ def processAllDocuments(file_paths, analyzer, labels, batch_size=30):
     logger.info(f'Completed batch {i}/{total_batches}')
 
   df = pd.DataFrame(all_results)
-  logger.info(f'All documents processed successfully. Success: {df['status'].value_counts().get("success", 0)}, Errors: {df['status'].value_counts().get("error", 0)}')
+
+  features, labels = prepareDataForActiveLearning(df)
+  sample_size = min(100, len(features))
+  if sample_size == 0:
+    logger.error("No features found for active learning")
+    raise ValueError("No features found for active learning")
+  initial_idx = np.random.choice(len(features), size=sample_size, replace=False)
+  active_learner = ActiveLearner(features[initial_idx], labels[initial_idx])
+
+  unlabeled_data = df.drop(df.index[initial_idx])
+  active_learner = activeLearningLoop(active_learner, unlabeled_data)
+
+  al_predictions = active_learner.predict(features)
+  al_probas = active_learner.predictProba(features)
+  df['al_category'] = al_predictions
+  df['al_confidence'] = np.max(al_probas, axis=1)
+
+  nn_features, nn_labels, num_classes = prepareDataForNeuralNet(df)
+  nn_validator = NeuralNetValidator(input_size=nn_features.shape[1], hidden_size=64, num_classes=num_classes)
+  train_dataset, val_dataset = nn_validator.prepareData(nn_features, nn_labels)
+  nn_validator.train(train_dataset, val_dataset)
+
+  nn_predictions, nn_probas = nn_validator.validate(nn_features)
+  df['nn_category'] = nn_predictions
+  df['nn_confidence'] = np.max(nn_probas, axis=1)
+
+  """ logger.info(f'Starting to validate {len(df)} documents')
+  validator = PostClassificationValidator()
+  validator.prepareData(df)
+  validator.train()
+  df = validator.validate(df) """
+
+  logger.info(f'All documents processed and validated successfully. Success: {df['status'].value_counts().get("success", 0)}, Errors: {df['status'].value_counts().get("error", 0)}')
   return df
 
 def fetchFiles(directory):
