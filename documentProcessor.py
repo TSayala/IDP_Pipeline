@@ -452,9 +452,11 @@ class CNNLSTM(nn.Module):
     output = self.fc2(x_combined)
     return output
   
-def trainCNNLSTM(model, train_loader, val_loader, num_epochs, learning_rate):
+def trainCNNLSTM(model, train_loader, val_loader, num_epochs, learning_rate, model_file='data/models/cnn_lstm_model.pth'):
   criterion = nn.CrossEntropyLoss()
   optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+  best_accuracy = 0.0
 
   for epoch in range(num_epochs):
     model.train()
@@ -477,6 +479,11 @@ def trainCNNLSTM(model, train_loader, val_loader, num_epochs, learning_rate):
 
     accuracy = 100 * correct / total
     logger.info(f'Epoch {epoch+1}/{num_epochs}, Accuracy: {accuracy:.2f}%')
+
+    if accuracy > best_accuracy:
+      best_accuracy = accuracy
+      torch.save(model.state_dict(), model_file)
+      logger.info(f'Model saved with accuracy: {best_accuracy:.2f}%')
 
   return model
 
@@ -557,15 +564,16 @@ class VotingClassifier:
   def __init__(self, threshold=0.6):
     self.threshold = threshold
 
-  def combinePredictions(self, few_shot_pred, al_pred, nn_pred, few_shot_conf, al_conf, nn_conf):
-    predictions = [few_shot_pred, al_pred, nn_pred]
-    confidences = [few_shot_conf, al_conf, nn_conf]
+  def combinePredictions(self, few_shot_pred, al_pred, nn_pred, cnn_lstm_pred,
+                         few_shot_conf, al_conf, nn_conf, cnn_lstm_conf):
+    predictions = [few_shot_pred, al_pred, nn_pred, cnn_lstm_pred]
+    confidences = [few_shot_conf, al_conf, nn_conf, cnn_lstm_conf]
 
     if len(set(predictions)) == 1:
       return predictions[0], max(confidences)
     
     for pred in predictions:
-      if predictions.count(pred) >= 2:
+      if predictions.count(pred) >= 3:
         conf = max([conf for p, conf in zip(predictions, confidences) if p == pred])
         if conf >= self.threshold:
           return pred, conf
@@ -575,8 +583,8 @@ class VotingClassifier:
   
 def applyVoting(row, voter):
   return voter.combinePredictions(
-    row['category'], row['al_category'], row['nn_category'],
-    row['confidence'], row['al_confidence'], row['nn_confidence']
+    row['category'], row['al_category'], row['nn_category'], row['cnn_lstm_category'],
+    row['confidence'], row['al_confidence'], row['nn_confidence'], row['cnn_lstm_confidence']
   )
 
 def prepareDataForNeuralNet(df):
@@ -697,6 +705,17 @@ def processAllDocuments(file_paths, examples, batch_size=30, force_reload=False)
 
   df = pd.DataFrame(all_results)
 
+  all_texts = []
+  all_layout_features = []
+  for file_path in df['file_path']:
+    text, layout = analyzer.extractFeatures(file_path)
+    all_texts.append(text)
+    all_layout_features.append(layout.flatten())
+
+  df['extracted_text'] = all_texts
+  layout_features = np.array(all_layout_features)
+
+  # Active learning
   features, labels = prepareDataForActiveLearning(df)
   sample_size = min(100, len(features))
   if sample_size == 0:
@@ -713,6 +732,7 @@ def processAllDocuments(file_paths, examples, batch_size=30, force_reload=False)
   df['al_category'] = al_predictions
   df['al_confidence'] = np.max(al_probas, axis=1)
 
+  # Neural network (SimpleNN)
   nn_features, nn_labels, num_classes = prepareDataForNeuralNet(df)
   nn_validator = NeuralNetValidator(input_size=nn_features.shape[1], hidden_size=64, num_classes=num_classes)
   train_dataset, val_dataset = nn_validator.prepareData(nn_features, nn_labels)
@@ -722,9 +742,57 @@ def processAllDocuments(file_paths, examples, batch_size=30, force_reload=False)
   df['nn_category'] = nn_predictions
   df['nn_confidence'] = np.max(nn_probas, axis=1)
 
-  voter = VotingClassifier(threshold=0.6)
-  df['voted_category'], df['voted_confidence'] = df.apply(lambda row: pd.Series(applyVoting(row, voter)), axis=1)
+  # CNN-LSTM
+  text_embeddings = np.array([getBertEmbeddings(text) for text in df['extracted_text']])
 
+  few_shot_layout_features = np.array([example['layout_features'].flatten() for example in cache.few_shot_examples])
+  few_shot_text_embeddings = np.array([getBertEmbeddings(example['text']) for example in cache.few_shot_examples])
+  few_shot_labels = LabelEncoder().fit_transform([example['category'] for example in cache.few_shot_examples])
+
+  combined_layout_features = np.vstack([few_shot_layout_features, layout_features])
+  combined_text_embeddings = np.vstack([few_shot_text_embeddings, text_embeddings])
+  combined_labels = np.concatenate([few_shot_labels, nn_labels])
+
+  dataset = TensorDataset(
+    torch.FloatTensor(combined_layout_features),
+    torch.FloatTensor(combined_text_embeddings),
+    torch.LongTensor(combined_labels)
+  )
+  train_size = int(0.8 * len(dataset))
+  val_size = len(dataset) - train_size
+  train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+  train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+  val_loader = DataLoader(val_dataset, batch_size=32)
+
+  cnn_lstm_model = CNNLSTM(
+    num_layout_features=combined_layout_features.shape[1],
+    text_embedding_dim=combined_text_embeddings.shape[1],
+    hidden_dim=64,
+    num_classes=len(set(combined_labels))
+  )
+
+  model_file = 'data/models/cnn_lstm_model.pth'
+  if os.path.exists(model_file):
+    cnn_lstm_model.load_state_dict(torch.load(model_file))
+    logger.info(f'Model loaded from file: {model_file}')
+  else:
+    cnn_lstm_model = trainCNNLSTM(cnn_lstm_model, train_loader, val_loader, num_epochs=10, learning_rate=0.001, model_file=model_file)
+
+  cnn_lstm_model.eval()
+  with torch.no_grad():
+    cnn_lstm_outputs = cnn_lstm_model(
+      torch.FloatTensor(layout_features),
+      torch.FloatTensor(text_embeddings)
+    )
+    cnn_lstm_probas = F.softmax(cnn_lstm_outputs, dim=1)
+    cnn_lstm_predictions = torch.argmax(cnn_lstm_probas, dim=1)
+
+  df['cnn_lstm_category'] = cnn_lstm_predictions.cpu().numpy()
+  df['cnn_lstm_confidence'] = torch.max(cnn_lstm_probas, dim=1)[0].cpu().numpy()
+
+  voter = VotingClassifier(threshold=0.6)
+  df['voted_category'], df['voted_confidence'] = zip(*df.apply(lambda row: applyVoting(row, voter), axis=1))
+      
   """ logger.info(f'Starting to validate {len(df)} documents')
   validator = PostClassificationValidator()
   validator.prepareData(df)
