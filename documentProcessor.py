@@ -39,6 +39,12 @@ from logging.handlers import RotatingFileHandler
 
 # Change this to match the number of available CPU cores
 NUM_WORKERS = 6
+CATEGORIES = [
+  'plan of care', 'discharge summary', 'prescription request',
+  'progress note', 'prescription authorization', 'lab results',
+  'result notification', 'formal records request', 'patient chart note',
+  'return to work', 'answering service', 'spam', 'other'
+]
 
 # Setup logging
 def setupLogger(log_file='document_processor.log'):
@@ -170,6 +176,50 @@ class FewShotDocumentProcessor:
     self.text_weight = 0.7
     self.layout_weight = 1.0 - self.text_weight
     self.threshold = 0.1
+    self.scaler = None
+
+  def extractFeatures(self, image_path):
+    try:
+      # extract text using OCR
+      text, pages = readTifFile(image_path)
+
+      # extract layout features
+      layout_features_list = []
+      for page in pages:
+        gray = cv2.cvtColor(page, cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+        lines = cv2.HoughLinesP(edges, 1, np.pi/180, 100, minLineLength=100, maxLineGap=10)
+
+        if lines is not None:
+          horizontal_lines = sum(1 for line in lines if abs(line[0][1] - line[0][3]) < 5)
+          vertical_lines = sum(1 for line in lines if abs(line[0][0] - line[0][2]) < 5)
+        else:
+          horizontal_lines, vertical_lines = 0, 0
+
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        dilated = cv2.dilate(thresh, kernel, iterations=1)
+        contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        text_regions = len(contours)
+        white_space_ratio = 1 - (cv2.countNonZero(thresh) / (page.shape[0] * page.shape[1]))
+
+        layout_features = np.array([
+          horizontal_lines,
+          vertical_lines,
+          text_regions,
+          white_space_ratio,
+          cv2.countNonZero(edges),
+          len(pytesseract.image_to_boxes(Image.fromarray(page)).splitlines())
+        ])
+        layout_features_list.append(layout_features)
+
+      combined_layout_features = np.mean(layout_features_list, axis=0)
+      return text, combined_layout_features.reshape(1, -1)
+    
+    except Exception as e:
+      logger.error(f"Error extracting features: {type(e).__name__} - {str(e)}")
+      return None, None
 
   def loadFewShotExamples(self, csv_path, force_reload=False):
     if not force_reload and self.cache.load():
@@ -206,40 +256,15 @@ class FewShotDocumentProcessor:
       except Exception as e:
         logger.error(f"Error loading few-shot examples: {type(e).__name__} - {str(e)}")
 
-  def extractFeatures(self, image_path):
-    try:
-      # extract text using OCR
-      text, pages = readTifFile(image_path)
-
-      # extract layout features
-      layout_features_list = []
-      for page in pages:
-        gray = cv2.cvtColor(page, cv2.COLOR_RGB2GRAY)
-        edges = cv2.Canny(gray, 50, 150, apertureSize=3)
-        lines = cv2.HoughLinesP(edges, 1, np.pi/180, 100, minLineLength=100, maxLineGap=10)
-
-        if lines is not None:
-          horizontal_lines = sum(1 for line in lines if abs(line[0][1] - line[0][3]) < 5)
-          vertical_lines = sum(1 for line in lines if abs(line[0][0] - line[0][2]) < 5)
-        else:
-          horizontal_lines, vertical_lines = 0, 0
-        layout_features = np.array([
-          horizontal_lines,
-          vertical_lines,
-          cv2.countNonZero(edges),
-          len(pytesseract.image_to_boxes(Image.fromarray(page)).splitlines())
-        ])
-        layout_features_list.append(layout_features)
-      combined_layout_features = np.mean(layout_features_list, axis=0)
-      return text, combined_layout_features.reshape(1, -1)
-    
-    except Exception as e:
-      logger.error(f"Error extracting features: {type(e).__name__} - {str(e)}")
-      return None, None
-
   def predict(self, image_path):
     text, layout = self.extractFeatures(image_path)
+    if text is None or layout is None:
+      return 'Error', 0.0
     query_embedding = self.model.encode(text, convert_to_tensor=True)
+    
+    if self.scaler is None:
+      logger.error("Scaler is not initialized")
+      return 'Error', 0.0
     layout = self.scaler.transform(layout)
 
     text_scores = util.cos_sim(query_embedding, self.few_shot_embeddings)[0]
@@ -266,6 +291,8 @@ class FewShotDocumentProcessor:
   
   def predictProba(self, image_path):
     text, layout = self.extractFeatures(image_path)
+    if text is None or layout is None:
+      return 'Error', 0.0
     query_embedding = self.model.encode(text, convert_to_tensor=True)
     layout = self.scaler.transform(layout)
 
@@ -606,16 +633,33 @@ def isFaxCover(text: str) -> Tuple[bool, List[str]]:
     return keyword_count >= 2, matched_keywords
       
 # Read the TIF file and extract text using OCR  
-def readTifFile(file_path):
+def readTifFile(file_path: str) -> Tuple[str, List[np.ndarray]]:
+  """
+  Reads a TIF file and extracts text from it using OCR.
+  Iterates by page and returns cleaned text and images for each page if a fax cover page is not detected.
+
+  returns:
+  Tuple[str, List[np.ndarray]]: A tuple containing the cleaned text and a list of images.
+  """
+  cleaner = TextCleaner()
   try:
     with Image.open(file_path) as img:
       pages = []
+      texts = []
       for i in range(img.n_frames):
         img.seek(i)
-        page = np.array(img)
-        text = pytesseract.image_to_string(page)
-        pages.append(text)
-    return " ".join(pages)
+        rgb_image = img.convert('RGB')
+        np_image = np.array(rgb_image)
+        text = pytesseract.image_to_string(np_image)
+        text = cleaner.clean(text)
+        if i == 0:
+          is_fax_cover, matched_keywords = isFaxCover(text)
+          if is_fax_cover:
+            logger.info(f"File '{file_path}': Detected a fax cover page. Keywords: {matched_keywords}")
+            continue
+        texts.append(text)
+        pages.append(np_image)
+    return " ".join(texts), pages
   except UnidentifiedImageError:
     logger.error(f"File '{file_path}': Not a valid image file or is corrupted")
     raise
@@ -627,38 +671,35 @@ def readTifFile(file_path):
     raise
 
 # Process the document
-def processDocument(args):
-  file_path, analyzer, labels = args
+def processDocument(args: Tuple[str, FewShotDocumentProcessor]) -> dict:
+  file_path, analyzer = args
 
   result = {
     'file_path': file_path,
-    'summary': None,
     'category': None,
     'confidence': None,
     'status': 'error',
     'error_message': None,
+    'text': None,
     'text_length': 0
   }
 
   try:
     logger.info(f"Processing document {file_path}")
-    document_text = readTifFile(file_path)
+    document_text, _ = analyzer.extractFeatures(file_path)
+    result['text'] = document_text
     result['text_length'] = len(document_text)
 
     if result['text_length'] == 0:
       logger.warning(f"File '{file_path}': Extracted text is empty for file: {file_path}")
       raise ValueError("Extracted text is empty")
     
-    summary = analyzer.summarize(document_text, file_path)
-    category, confidence = analyzer.classify(summary, labels, file_path)
+    category, confidence = analyzer.predict(file_path)
 
-    """ summary, category, confidence = analyzer.analyzeDocument(document_text, labels)
-    if summary is None or category is None or confidence is None:
-      logger.warning(f'Error processing document {file_path}: Summary: {summary}, Category: {category}, Confidence: {confidence}')
-      raise ValueError('Analysis failed') """
+    if category not in CATEGORIES:
+      category = 'other'
 
     result.update({
-      'summary': summary,
       'category': category,
       'confidence': confidence,
       'status': 'success' if category and confidence else 'partial success'
@@ -672,10 +713,10 @@ def processDocument(args):
   return result
 
 # Process the batches
-def processBatch(batch, analyzer, labels):
+def processBatch(batch: List[str], analyzer: FewShotDocumentProcessor) -> List[dict]:
   results = []
   with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
-    future_to_file = {executor.submit(processDocument, (file_path, analyzer, labels)): file_path for file_path in batch}
+    future_to_file = {executor.submit(processDocument, (file_path, analyzer)): file_path for file_path in batch}
     for future in as_completed(future_to_file):
       result = future.result()
       results.append(result)
@@ -688,7 +729,7 @@ def batchGenerator(file_paths, batch_size):
     yield file_paths[i:i+batch_size]
 
 # Process all the documents in the corpus
-def processAllDocuments(file_paths, examples, batch_size=30, force_reload=False):
+def processAllDocuments(file_paths: List[str], examples: str, batch_size: int = 30, force_reload: bool = False) -> pd.DataFrame:
   cache = FewShotCache()
   analyzer = FewShotDocumentProcessor(cache=cache)
   analyzer.loadFewShotExamples(examples, force_reload=force_reload)
@@ -699,7 +740,7 @@ def processAllDocuments(file_paths, examples, batch_size=30, force_reload=False)
   logger.info(f'Starting to process {len(file_paths)} documents in {total_batches} batches')
   for i, batch in enumerate(batchGenerator(file_paths, batch_size), 1):
     logger.info(f'Processing batch {i}/{total_batches}')
-    batch_results = processBatch(batch, analyzer, labels)
+    batch_results = processBatch(batch, analyzer)
     all_results.extend(batch_results)
     logger.info(f'Completed batch {i}/{total_batches}')
 
