@@ -204,13 +204,16 @@ class FewShotDocumentProcessor:
         text_regions = len(contours)
         white_space_ratio = 1 - (cv2.countNonZero(thresh) / (page.shape[0] * page.shape[1]))
 
+        text_boxes = pytesseract.image_to_boxes(Image.fromarray(page))
+        num_text_boxes = len(text_boxes.splitlines()) if text_boxes else 0
+
         layout_features = np.array([
           horizontal_lines,
           vertical_lines,
           text_regions,
           white_space_ratio,
           cv2.countNonZero(edges),
-          len(pytesseract.image_to_boxes(Image.fromarray(page)).splitlines())
+          num_text_boxes
         ])
         layout_features_list.append(layout_features)
 
@@ -232,20 +235,37 @@ class FewShotDocumentProcessor:
       logger.info("Few-shot examples not found in cache. Loading from CSV file")
       try:
         df = pd.read_csv(csv_path)
+        logger.debug(f"Loaded {len(df)} few-shot examples from CSV file")
         self.few_shot_examples = df.to_dict('records')
         texts = []
         layouts = []
 
+        logger.debug("Extracting features from few-shot examples")
         for example in self.few_shot_examples:
           text, layout = self.extractFeatures(example['file_path'])
           texts.append(text)
           layouts.append(layout)
+          #logger.debug(f"Extracted features for few-shot example: {example['file_path']}")
+          logger.debug(f"Layout shape for {example['file_path']}: {layout.shape}")
 
+        # Check for consistent dimensions
+        layout_shapes = [layout.shape[1] for layout in layouts]
+        if len(set(layout_shapes)) != 1:
+          raise ValueError(f"Inconsistent layout dimensions: {layout_shapes}")
+
+        logger.debug("Encoding texts")
         self.few_shot_embeddings = self.model.encode(texts, convert_to_tensor=True)
+        logger.debug(f"Few-shot embeddings shape: {self.few_shot_embeddings.shape}")
+
+        logger.debug("Stacking layouts")
         self.few_shot_layouts = np.vstack(layouts)
+        logger.debug(f"Few-shot layouts shape: {self.few_shot_layouts.shape}")
+
+        logger.debug("Fitting scaler")
         self.scaler = StandardScaler()
         self.scaler.fit(self.few_shot_layouts)
 
+        logger.debug("Saving few-shot examples to cache")
         self.cache.few_shot_examples = self.few_shot_examples
         self.cache.few_shot_embeddings = self.few_shot_embeddings
         self.cache.few_shot_layouts = self.few_shot_layouts
@@ -262,9 +282,9 @@ class FewShotDocumentProcessor:
       return 'Error', 0.0
     query_embedding = self.model.encode(text, convert_to_tensor=True)
     
-    if self.scaler is None:
+    """ if self.scaler is None:
       logger.error("Scaler is not initialized")
-      return 'Error', 0.0
+      return 'Error', 0.0 """
     layout = self.scaler.transform(layout)
 
     text_scores = util.cos_sim(query_embedding, self.few_shot_embeddings)[0]
@@ -745,7 +765,7 @@ def processAllDocuments(file_paths: List[str], examples: str, batch_size: int = 
     logger.info(f'Completed batch {i}/{total_batches}')
 
   df = pd.DataFrame(all_results)
-
+  #
   all_texts = []
   all_layout_features = []
   for file_path in df['file_path']:
@@ -833,12 +853,6 @@ def processAllDocuments(file_paths: List[str], examples: str, batch_size: int = 
 
   voter = VotingClassifier(threshold=0.6)
   df['voted_category'], df['voted_confidence'] = zip(*df.apply(lambda row: applyVoting(row, voter), axis=1))
-      
-  """ logger.info(f'Starting to validate {len(df)} documents')
-  validator = PostClassificationValidator()
-  validator.prepareData(df)
-  validator.train()
-  df = validator.validate(df) """
 
   logger.info(f'All documents processed and validated successfully. Success: {df['status'].value_counts().get("success", 0)}, Errors: {df['status'].value_counts().get("error", 0)}')
   return df
