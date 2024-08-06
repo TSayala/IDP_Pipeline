@@ -186,43 +186,53 @@ class FewShotDocumentProcessor:
       # extract layout features
       layout_features_list = []
       for page in pages:
-        gray = cv2.cvtColor(page, cv2.COLOR_RGB2GRAY)
-        edges = cv2.Canny(gray, 50, 150, apertureSize=3)
-        lines = cv2.HoughLinesP(edges, 1, np.pi/180, 100, minLineLength=100, maxLineGap=10)
+        try:
+          gray = cv2.cvtColor(page, cv2.COLOR_RGB2GRAY)
+          edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+          lines = cv2.HoughLinesP(edges, 1, np.pi/180, 100, minLineLength=100, maxLineGap=10)
 
-        if lines is not None:
-          horizontal_lines = sum(1 for line in lines if abs(line[0][1] - line[0][3]) < 5)
-          vertical_lines = sum(1 for line in lines if abs(line[0][0] - line[0][2]) < 5)
-        else:
-          horizontal_lines, vertical_lines = 0, 0
+          if lines is not None:
+            horizontal_lines = sum(1 for line in lines if abs(line[0][1] - line[0][3]) < 5)
+            vertical_lines = sum(1 for line in lines if abs(line[0][0] - line[0][2]) < 5)
+          else:
+            horizontal_lines, vertical_lines = 0, 0
 
-        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        dilated = cv2.dilate(thresh, kernel, iterations=1)
-        contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+          _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+          kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+          dilated = cv2.dilate(thresh, kernel, iterations=1)
+          contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        text_regions = len(contours)
-        white_space_ratio = 1 - (cv2.countNonZero(thresh) / (page.shape[0] * page.shape[1]))
+          text_regions = len(contours)
+          white_space_ratio = 1 - (cv2.countNonZero(thresh) / (page.shape[0] * page.shape[1]))
 
-        text_boxes = pytesseract.image_to_boxes(Image.fromarray(page))
-        num_text_boxes = len(text_boxes.splitlines()) if text_boxes else 0
+          text_boxes = pytesseract.image_to_boxes(Image.fromarray(page))
+          num_text_boxes = len(text_boxes.splitlines()) if text_boxes else 0
 
-        layout_features = np.array([
-          horizontal_lines,
-          vertical_lines,
-          text_regions,
-          white_space_ratio,
-          cv2.countNonZero(edges),
-          num_text_boxes
-        ])
-        layout_features_list.append(layout_features)
+          layout_features = np.array([
+            horizontal_lines,
+            vertical_lines,
+            text_regions,
+            white_space_ratio,
+            cv2.countNonZero(edges),
+            num_text_boxes
+          ])
+          layout_features_list.append(layout_features)
+        except Exception as e:
+          logger.error(f"Error extracting layout features for page: {type(e).__name__} - {str(e)}")
+          layout_features_list.append(np.zeros((6,)))
 
-      combined_layout_features = np.mean(layout_features_list, axis=0)
-      return text, combined_layout_features.reshape(1, -1)
+      if not layout_features_list:
+        logger.error(f"No layout features extracted for {image_path}. Using default features")
+        combined_layout_features = np.zeros((1, 6))
+      else:                     
+        combined_layout_features = np.mean(layout_features_list, axis=0).reshape(1, -1)
+
+      logger.debug(f"Layout shape for {image_path}: {combined_layout_features.shape}")
+      return text, combined_layout_features
     
     except Exception as e:
       logger.error(f"Error extracting features: {type(e).__name__} - {str(e)}")
-      return None, None
+      return None, np.zeros((1, 6))
 
   def loadFewShotExamples(self, csv_path, force_reload=False):
     if not force_reload and self.cache.load():
@@ -451,29 +461,6 @@ def getBertEmbeddings(text, max_length=512):
     outputs = model(**inputs)
   return outputs.last_hidden_state[:, 0, :].numpy()
 
-def extractLayoutFeatures(image):
-  gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-  edges = cv2.Canny(gray, 50, 150, apertureSize=3)
-  lines = cv2.HoughLinesP(edges, 1, np.pi/180, 100, minLineLength=100, maxLineGap=10)
-  horizontal_lines = 0
-  vertical_lines = 0
-  if lines is not None:
-    for line in lines:
-      x1, y1, x2, y2 = line[0]
-      if abs(y2 - y1) < 5:
-        horizontal_lines += 1
-      elif abs(x2 - x1) < 5:
-        vertical_lines += 1
-
-  _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-  kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-  dilated = cv2.dilate(thresh, kernel, iterations=1)
-  contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-  text_regions = len(contours)
-  white_space_ratio = 1 - (cv2.countNonZero(thresh) / (image.shape[0] * image.shape[1]))
-  return np.array([horizontal_lines, vertical_lines, text_regions, white_space_ratio])
-
 class CNNLSTM(nn.Module):
   def __init__(self, num_layout_features, text_embedding_dim, hidden_dim, num_classes):
     super(CNNLSTM, self).__init__()
@@ -639,7 +626,7 @@ def prepareDataForNeuralNet(df):
   labels = pd.factorize(df['category'])[0]
   return features, labels, len(set(labels))
 
-def isFaxCover(text: str) -> Tuple[bool, List[str]]:
+def isFaxCover(text: str) -> Tuple[bool, List[Tuple[str, int]]]:
   keywords = ['fax', 'cover', 'sheet', 'attached']
   text = text.lower()
   matched_keywords = []
@@ -647,10 +634,10 @@ def isFaxCover(text: str) -> Tuple[bool, List[str]]:
   for keyword in keywords:
     count = text.count(keyword)
     if count > 0:
-      matched_keywords.append(keyword)
+      matched_keywords.append((keyword, count))
       keyword_count += count
     
-    return keyword_count >= 2, matched_keywords
+  return keyword_count >= 2, matched_keywords
       
 # Read the TIF file and extract text using OCR  
 def readTifFile(file_path: str) -> Tuple[str, List[np.ndarray]]:
@@ -672,7 +659,7 @@ def readTifFile(file_path: str) -> Tuple[str, List[np.ndarray]]:
         np_image = np.array(rgb_image)
         text = pytesseract.image_to_string(np_image)
         text = cleaner.clean(text)
-        if i == 0:
+        if i == 0 and img.n_frames > 1:
           is_fax_cover, matched_keywords = isFaxCover(text)
           if is_fax_cover:
             logger.info(f"File '{file_path}': Detected a fax cover page. Keywords: {matched_keywords}")
@@ -771,6 +758,9 @@ def processAllDocuments(file_paths: List[str], examples: str, batch_size: int = 
   for file_path in df['file_path']:
     text, layout = analyzer.extractFeatures(file_path)
     all_texts.append(text)
+    if layout.shape[1] != 6:
+      logger.warning(f"Layout features shape mismatch for file: {file_path}: {layout.shape}. Using default features")
+      layout = np.zeros(1, 6)
     all_layout_features.append(layout.flatten())
 
   df['extracted_text'] = all_texts
