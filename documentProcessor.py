@@ -30,6 +30,7 @@ from sklearn.metrics import classification_report
 from modAL.models import ActiveLearner
 from modAL.uncertainty import uncertainty_sampling
 
+from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
 from transformers import BertTokenizer, BertModel
 
 import pandas as pd
@@ -249,12 +250,14 @@ class FewShotDocumentProcessor:
         self.few_shot_examples = df.to_dict('records')
         texts = []
         layouts = []
+        categories = []
 
         logger.debug("Extracting features from few-shot examples")
         for example in self.few_shot_examples:
           text, layout = self.extractFeatures(example['file_path'])
           texts.append(text)
           layouts.append(layout)
+          categories.append(example['category'])
           #logger.debug(f"Extracted features for few-shot example: {example['file_path']}")
           logger.debug(f"Layout shape for {example['file_path']}: {layout.shape}")
 
@@ -275,6 +278,9 @@ class FewShotDocumentProcessor:
         self.scaler = StandardScaler()
         self.scaler.fit(self.few_shot_layouts)
 
+        self.few_shot_examples = [{'text': text, 'layout': layout, 'category': category}
+                                  for text, layout, category in zip(texts, layouts, categories)]
+
         logger.debug("Saving few-shot examples to cache")
         self.cache.few_shot_examples = self.few_shot_examples
         self.cache.few_shot_embeddings = self.few_shot_embeddings
@@ -290,11 +296,9 @@ class FewShotDocumentProcessor:
     text, layout = self.extractFeatures(image_path)
     if text is None or layout is None:
       return 'Error', 0.0
+
+    # Few-shot classification
     query_embedding = self.model.encode(text, convert_to_tensor=True)
-    
-    """ if self.scaler is None:
-      logger.error("Scaler is not initialized")
-      return 'Error', 0.0 """
     layout = self.scaler.transform(layout)
 
     text_scores = util.cos_sim(query_embedding, self.few_shot_embeddings)[0]
@@ -312,17 +316,16 @@ class FewShotDocumentProcessor:
     total_score = sum(scores)
     normalized_scores = [score / total_score for score in scores]
 
-    if normalized_scores[0] > self.threshold:
+    if normalized_scores > self.threshold:
       return categories[0], normalized_scores[0]
     else:
       return 'Uncertain', normalized_scores[0]
-    #top_result = torch.argmax(combined_scores)
-    #return self.few_shot_examples[top_result]['category']
   
   def predictProba(self, image_path):
     text, layout = self.extractFeatures(image_path)
     if text is None or layout is None:
       return 'Error', 0.0
+
     query_embedding = self.model.encode(text, convert_to_tensor=True)
     layout = self.scaler.transform(layout)
 
@@ -688,14 +691,16 @@ def processDocument(args: Tuple[str, FewShotDocumentProcessor]) -> dict:
     'status': 'error',
     'error_message': None,
     'text': None,
-    'text_length': 0
+    'text_length': 0,
+    'num_pages': 0
   }
 
   try:
     logger.info(f"Processing document {file_path}")
-    document_text, _ = analyzer.extractFeatures(file_path)
+    document_text, pages = analyzer.extractFeatures(file_path)
     result['text'] = document_text
     result['text_length'] = len(document_text)
+    result['num_pages'] = len(pages)
 
     if result['text_length'] == 0:
       logger.warning(f"File '{file_path}': Extracted text is empty for file: {file_path}")
@@ -753,7 +758,7 @@ def processAllDocuments(file_paths: List[str], examples: str, batch_size: int = 
 
   df = pd.DataFrame(all_results)
   #
-  all_texts = []
+  """ all_texts = []
   all_layout_features = []
   for file_path in df['file_path']:
     text, layout = analyzer.extractFeatures(file_path)
@@ -842,7 +847,7 @@ def processAllDocuments(file_paths: List[str], examples: str, batch_size: int = 
   df['cnn_lstm_confidence'] = torch.max(cnn_lstm_probas, dim=1)[0].cpu().numpy()
 
   voter = VotingClassifier(threshold=0.6)
-  df['voted_category'], df['voted_confidence'] = zip(*df.apply(lambda row: applyVoting(row, voter), axis=1))
+  df['voted_category'], df['voted_confidence'] = zip(*df.apply(lambda row: applyVoting(row, voter), axis=1)) """
 
   logger.info(f'All documents processed and validated successfully. Success: {df['status'].value_counts().get("success", 0)}, Errors: {df['status'].value_counts().get("error", 0)}')
   return df
