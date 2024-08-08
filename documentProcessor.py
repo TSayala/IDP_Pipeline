@@ -253,13 +253,18 @@ class FewShotDocumentProcessor:
         categories = []
 
         logger.debug("Extracting features from few-shot examples")
-        for example in self.few_shot_examples:
-          text, layout = self.extractFeatures(example['file_path'])
+        for _, row in df.iterrows():
+          text, layout = self.extractFeatures(row['file_path'])
           texts.append(text)
           layouts.append(layout)
-          categories.append(example['category'])
-          #logger.debug(f"Extracted features for few-shot example: {example['file_path']}")
-          logger.debug(f"Layout shape for {example['file_path']}: {layout.shape}")
+          categories.append(row['category'])
+          self.few_shot_examples.append({
+            'file_path': row['file_path'],
+            'text': text,
+            'layout': layout,
+            'category': row['category']
+          })
+          logger.debug(f"Layout shape for {row['file_path']}: {layout.shape}")
 
         # Check for consistent dimensions
         layout_shapes = [layout.shape[1] for layout in layouts]
@@ -277,9 +282,6 @@ class FewShotDocumentProcessor:
         logger.debug("Fitting scaler")
         self.scaler = StandardScaler()
         self.scaler.fit(self.few_shot_layouts)
-
-        self.few_shot_examples = [{'text': text, 'layout': layout, 'category': category}
-                                  for text, layout, category in zip(texts, layouts, categories)]
 
         logger.debug("Saving few-shot examples to cache")
         self.cache.few_shot_examples = self.few_shot_examples
@@ -308,18 +310,18 @@ class FewShotDocumentProcessor:
     combined_scores = self.text_weight * text_scores + self.layout_weight * torch.tensor(layout_scores, device=self.device)
 
     top_k = 3
-    top_indices = torch.topk(combined_scores, k=top_k).indices
+    top_indices = torch.topk(combined_scores, k=top_k).indices.cpu().numpy()
 
     categories = [self.few_shot_examples[i]['category'] for i in top_indices]
-    scores = combined_scores[top_indices].tolist()
+    scores = combined_scores[top_indices].cpu().numpy()
 
-    total_score = sum(scores)
-    normalized_scores = [score / total_score for score in scores]
+    total_score = np.sum(scores)
+    normalized_scores = scores / total_score if total_score != 0 else np.zeros_like(scores)
 
-    if normalized_scores > self.threshold:
-      return categories[0], normalized_scores[0]
+    if np.any(normalized_scores > self.threshold):
+      return categories[0], float(normalized_scores[0])
     else:
-      return 'Uncertain', normalized_scores[0]
+      return 'Uncertain', float(normalized_scores[0])
   
   def predictProba(self, image_path):
     text, layout = self.extractFeatures(image_path)
@@ -381,254 +383,6 @@ class FewShotCache:
     self.init()
     logger.info("Cache has been cleared")
 
-class PostClassificationValidator:
-  def __init__(self):
-    self.classifier = RandomForestClassifier(n_estimators=100, random_state=42)
-    self.features = None
-    self.labels = None
-
-  def prepareData(self, df):
-    self.features = df[['confidence', 'text_length', 'num_pages']]
-    self.labels = df['category']
-  
-  def train(self):
-    X_train, X_test, y_train, y_test = train_test_split(self.features, self.labels, test_size=0.2, random_state=42)
-    self.classifier.fit(X_train, y_train)
-    y_pred = self.classifier.predict(X_test)
-    print(classification_report(y_test, y_pred))
-
-  def validate(self, new_results):
-    features = new_results[['confidence', 'text_length', 'num_pages']]
-    validated_categories = self.classifier.predict(features)
-    validated_probas = self.classifier.predict_proba(features)
-
-    new_results['validated_category'] = validated_categories
-    new_results['validated_confidence'] = validated_probas.max(axis=1)
-    return new_results
-  
-  def saveModel(self, model_file='data/models/post_classifier.pkl'):
-    with open(model_file, 'wb') as f:
-      pickle.dump(self.classifier, f)
-
-  def loadModel(self, model_file='data/models/post_classifier.pkl'):
-    with open(model_file, 'rb') as f:
-      self.classifier = pickle.load(f)
-
-class ActiveLearner:
-  def __init__(self, initial_data, initial_labels):
-    self.classifier = RandomForestClassifier(n_estimators=100, random_state=42)
-    self.learner = ActiveLearner(
-      estimator=self.classifier,
-      X_training=initial_data,
-      y_training=initial_labels,
-      query_strategy=uncertainty_sampling      
-    )
-
-  def query(self, unlabeled_data, n_instances=1):
-    query_idx, query_instance = self.learner.query(unlabeled_data, n_instances=n_instances)
-    return query_idx, query_instance
-  
-  def teach(self, X, y):
-    self.learner.teach(X, y)
-
-  def predict(self, X):
-    return self.learner.predict(X)
-  
-  def predictProba(self, X):
-    return self.learner.predict_proba(X)
-  
-def prepareDataForActiveLearning(df):
-  features = df[['confidence', 'text_length', 'num_pages']].values
-  labels = df['category'].values
-  return features, labels
-
-def activeLearningLoop(active_learner, unlabeled_data, batch_size=10):
-  while len(unlabeled_data) > 0:
-    query_idx, query_instance = active_learner.query(unlabeled_data, n_instances=batch_size)
-    
-    # simulate labeling
-    human_labels = unlabeled_data['category'].iloc[query_idx].values
-
-    active_learner.teach(query_instance, human_labels)
-    unlabeled_data = unlabeled_data.drop(unlabeled_data.index[query_idx])
-    logger.info(f"Remaining unlabeled data: {len(unlabeled_data)}")
-
-  return active_learner
-
-def getBertEmbeddings(text, max_length=512):
-  tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-  model = BertModel.from_pretrained('bert-base-uncased')
-
-  inputs = tokenizer(text, return_tensors='pt', max_length=max_length, truncation=True, padding=True)
-  with torch.no_grad():
-    outputs = model(**inputs)
-  return outputs.last_hidden_state[:, 0, :].numpy()
-
-class CNNLSTM(nn.Module):
-  def __init__(self, num_layout_features, text_embedding_dim, hidden_dim, num_classes):
-    super(CNNLSTM, self).__init__()
-    self.conv1 = nn.Conv1d(1, 32, kernel_size=3, padding=1)
-    self.conv2 = nn.Conv1d(32, 64, kernel_size=3, padding=1)
-    self.pool = nn.MaxPool1d(kernel_size=2)
-    self.fc1 = nn.Linear(64 * (num_layout_features // 2), hidden_dim)
-
-    self.lstm = nn.LSTM(text_embedding_dim, hidden_dim, batch_first=True)
-    self.fc2 = nn.Linear(hidden_dim * 2, num_classes)
-
-  def forward(self, layout_features, text_embeddings):
-    x_layout = layout_features.unsqueeze(1)
-    x_layout = self.pool(F.relu(self.conv1(x_layout)))
-    x_layout = self.pool(F.relu(self.conv2(x_layout)))
-    x_layout = x_layout.view(x_layout.size(0), -1)
-    x_layout = F.relu(self.fc1(x_layout))
-
-    _, (h_n, _) = self.lstm(text_embeddings)
-    x_text = h_n.squeeze(0)
-
-    x_combined = torch.cat((x_layout, x_text), dim=1)
-    output = self.fc2(x_combined)
-    return output
-  
-def trainCNNLSTM(model, train_loader, val_loader, num_epochs, learning_rate, model_file='data/models/cnn_lstm_model.pth'):
-  criterion = nn.CrossEntropyLoss()
-  optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-
-  best_accuracy = 0.0
-
-  for epoch in range(num_epochs):
-    model.train()
-    for layout_features, text_embeddings, labels in train_loader:
-      optimizer.zero_grad()
-      outputs = model(layout_features, text_embeddings)
-      loss = criterion(outputs, labels)
-      loss.backward()
-      optimizer.step()
-
-    model.eval()
-    correct = 0
-    total = 0
-    with torch.no_grad():
-      for layout_features, text_embeddings, labels in val_loader:
-        outputs = model(layout_features, text_embeddings)
-        _, predicted = torch.max(outputs.data, 1)
-        total += labels.size(0)
-        correct += (predicted == labels).sum().item()
-
-    accuracy = 100 * correct / total
-    logger.info(f'Epoch {epoch+1}/{num_epochs}, Accuracy: {accuracy:.2f}%')
-
-    if accuracy > best_accuracy:
-      best_accuracy = accuracy
-      torch.save(model.state_dict(), model_file)
-      logger.info(f'Model saved with accuracy: {best_accuracy:.2f}%')
-
-  return model
-
-
-class SimpleNN(nn.Module):
-  def __init__(self, input_size, hidden_size, num_classes):
-    super(SimpleNN, self).__init__()
-    self.fc1 = nn.Linear(input_size, hidden_size)
-    self.relu = nn.ReLU()
-    self.fc2 = nn.Linear(hidden_size, num_classes)
-  
-  def forward(self, x):
-    out = self.fc1(x)
-    out = self.relu(out)
-    out = self.fc2(out)
-    return out
-  
-class NeuralNetValidator:
-  def __init__(self, input_size, hidden_size, num_classes):
-    self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    self.model = SimpleNN(input_size, hidden_size, num_classes).to(self.device)
-    self.criterion = nn.CrossEntropyLoss()
-    self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
-    self.scaler = StandardScaler()
-
-    def prepareData(self, features, labels):
-      X_scaled = self.scaler.fit_transform(features)
-      X_train, X_val, y_train, y_val = train_test_split(X_scaled, labels, test_size=0.2, random_state=42)
-
-      X_train_tensor = torch.FloatTensor(X_train).to(self.device)
-      y_train_tensor = torch.LongTensor(y_train).to(self.device)
-      X_val_tensor = torch.FloatTensor(X_val).to(self.device)
-      y_val_tensor = torch.LongTensor(y_val).to(self.device)
-
-      train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
-      val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
-      return train_dataset, val_dataset
-    
-  def train(self, train_dataset, val_dataset, num_epochs=50, batch_size=32):
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size)
-
-    for epoch in range(num_epochs):
-      self.model.train()
-      for batch_features, batch_labels in train_loader:
-        self.optimizer.zero_grad()
-        outputs = self.model(batch_features)
-        loss = self.criterion(outputs, batch_labels)
-        loss.backward()
-        self.optimizer.step()
-
-      # validation
-      self.model.eval()
-      val_loss = 0
-      correct = 0
-      total = 0
-      with torch.no_grad():
-        for batch_features, batch_labels in val_loader:
-          outputs = self.model(batch_features)
-          loss = self.criterion(outputs, batch_labels)
-          val_loss += loss.item()
-          _, predicted = torch.max(outputs.data, 1)
-          total += batch_labels.size(0)
-          correct += (predicted == batch_labels).sum().item()
-
-      logger.info(f'Epoch {epoch+1}/{num_epochs}, Loss: {val_loss/len(val_loader):.4f}, Accuracy: {100*correct/total:.2f}%')
-
-  def validate(self, features):
-    X_scaled = self.scaler.transform(features)
-    X_tensor = torch.FloatTensor(X_scaled).to(self.device)
-    with torch.no_grad():
-      outputs = self.model(X_tensor)
-      probabilities = torch.softmax(outputs, dim=1)
-      predicted = torch.argmax(probabilities, dim=1)
-    return predicted.cpu().numpy(), probabilities.cpu().numpy()
-
-class VotingClassifier:
-  def __init__(self, threshold=0.6):
-    self.threshold = threshold
-
-  def combinePredictions(self, few_shot_pred, al_pred, nn_pred, cnn_lstm_pred,
-                         few_shot_conf, al_conf, nn_conf, cnn_lstm_conf):
-    predictions = [few_shot_pred, al_pred, nn_pred, cnn_lstm_pred]
-    confidences = [few_shot_conf, al_conf, nn_conf, cnn_lstm_conf]
-
-    if len(set(predictions)) == 1:
-      return predictions[0], max(confidences)
-    
-    for pred in predictions:
-      if predictions.count(pred) >= 3:
-        conf = max([conf for p, conf in zip(predictions, confidences) if p == pred])
-        if conf >= self.threshold:
-          return pred, conf
-        
-    max_conf_index = confidences.index(max(confidences))
-    return predictions[max_conf_index], confidences[max_conf_index]
-  
-def applyVoting(row, voter):
-  return voter.combinePredictions(
-    row['category'], row['al_category'], row['nn_category'], row['cnn_lstm_category'],
-    row['confidence'], row['al_confidence'], row['nn_confidence'], row['cnn_lstm_confidence']
-  )
-
-def prepareDataForNeuralNet(df):
-  features = df[['confidence', 'text_length', 'num_pages']].values
-  labels = pd.factorize(df['category'])[0]
-  return features, labels, len(set(labels))
-
 def isFaxCover(text: str) -> Tuple[bool, List[Tuple[str, int]]]:
   keywords = ['fax', 'cover', 'sheet', 'attached']
   text = text.lower()
@@ -641,8 +395,7 @@ def isFaxCover(text: str) -> Tuple[bool, List[Tuple[str, int]]]:
       keyword_count += count
     
   return keyword_count >= 2, matched_keywords
-      
-# Read the TIF file and extract text using OCR  
+
 def readTifFile(file_path: str) -> Tuple[str, List[np.ndarray]]:
   """
   Reads a TIF file and extracts text from it using OCR.
@@ -680,7 +433,6 @@ def readTifFile(file_path: str) -> Tuple[str, List[np.ndarray]]:
     logger.error(f"File '{file_path}': Unexpected error reading file: {str(e)}")
     raise
 
-# Process the document
 def processDocument(args: Tuple[str, FewShotDocumentProcessor]) -> dict:
   file_path, analyzer = args
 
@@ -724,7 +476,6 @@ def processDocument(args: Tuple[str, FewShotDocumentProcessor]) -> dict:
 
   return result
 
-# Process the batches
 def processBatch(batch: List[str], analyzer: FewShotDocumentProcessor) -> List[dict]:
   results = []
   with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
@@ -735,12 +486,10 @@ def processBatch(batch: List[str], analyzer: FewShotDocumentProcessor) -> List[d
       logger.debug(f'Processed document: {result["file_path"]} (Status: {result["status"]})')     
   return results
 
-# Generate batches of files
 def batchGenerator(file_paths, batch_size):
   for i in range(0, len(file_paths), batch_size):
     yield file_paths[i:i+batch_size]
 
-# Process all the documents in the corpus
 def processAllDocuments(file_paths: List[str], examples: str, batch_size: int = 30, force_reload: bool = False) -> pd.DataFrame:
   cache = FewShotCache()
   analyzer = FewShotDocumentProcessor(cache=cache)
@@ -765,7 +514,7 @@ def processAllDocuments(file_paths: List[str], examples: str, batch_size: int = 
     all_texts.append(text)
     if layout.shape[1] != 6:
       logger.warning(f"Layout features shape mismatch for file: {file_path}: {layout.shape}. Using default features")
-      layout = np.zeros(1, 6)
+      layout = np.zeros((1, 6))
     all_layout_features.append(layout.flatten())
 
   df['extracted_text'] = all_texts
@@ -801,7 +550,7 @@ def processAllDocuments(file_paths: List[str], examples: str, batch_size: int = 
   # CNN-LSTM
   text_embeddings = np.array([getBertEmbeddings(text) for text in df['extracted_text']])
 
-  few_shot_layout_features = np.array([example['layout_features'].flatten() for example in cache.few_shot_examples])
+  few_shot_layout_features = np.array([example['layout'].flatten() for example in cache.few_shot_examples])
   few_shot_text_embeddings = np.array([getBertEmbeddings(example['text']) for example in cache.few_shot_examples])
   few_shot_labels = LabelEncoder().fit_transform([example['category'] for example in cache.few_shot_examples])
 
