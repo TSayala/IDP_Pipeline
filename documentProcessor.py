@@ -42,7 +42,7 @@ from logging.handlers import RotatingFileHandler
 NUM_WORKERS = 6
 CATEGORIES = [
   'plan of care', 'discharge summary', 'prescription request',
-  'progress note', 'prescription authorization', 'lab results',
+  'progress note', 'prior authorization', 'lab results',
   'result notification', 'formal records request', 'patient chart note',
   'return to work', 'answering service', 'spam', 'other'
 ]
@@ -228,7 +228,7 @@ class FewShotDocumentProcessor:
       else:                     
         combined_layout_features = np.mean(layout_features_list, axis=0).reshape(1, -1)
 
-      logger.debug(f"Layout shape for {image_path}: {combined_layout_features.shape}")
+      #logger.debug(f"Layout shape for {image_path}: {combined_layout_features.shape}")
       return text, combined_layout_features
     
     except Exception as e:
@@ -264,7 +264,7 @@ class FewShotDocumentProcessor:
             'layout': layout,
             'category': row['category']
           })
-          logger.debug(f"Layout shape for {row['file_path']}: {layout.shape}")
+          #logger.debug(f"Layout shape for {row['file_path']}: {layout.shape}")
 
         # Check for consistent dimensions
         layout_shapes = [layout.shape[1] for layout in layouts]
@@ -294,6 +294,16 @@ class FewShotDocumentProcessor:
       except Exception as e:
         logger.error(f"Error loading few-shot examples: {type(e).__name__} - {str(e)}")
 
+  def updateFewShotExamples(self, image_path, verified_category):
+    text, layout = self.extractFeatures(image_path)
+    new_example = {
+      'file_path': image_path,
+      'text': text,
+      'layout': layout,
+      'category': verified_category
+    }
+    self.cache.update(new_example)
+
   def predict(self, image_path):
     text, layout = self.extractFeatures(image_path)
     if text is None or layout is None:
@@ -321,7 +331,7 @@ class FewShotDocumentProcessor:
     if np.any(normalized_scores > self.threshold):
       return categories[0], float(normalized_scores[0])
     else:
-      return 'Uncertain', float(normalized_scores[0])
+      return 'other', float(normalized_scores[0])
   
   def predictProba(self, image_path):
     text, layout = self.extractFeatures(image_path)
@@ -375,6 +385,14 @@ class FewShotCache:
         self.scaler = data.get('scaler')
       return True
     return False
+  
+  def update(self, new_example):
+    self.few_shot_examples.append(new_example)
+    text, layout = new_example['text'], new_example['layout']
+    self.few_shot_embeddings = torch.cat([self.few_shot_embeddings, self.model.encode([text], convert_to_tensor=True)])
+    self.few_shot_layouts = np.vstack([self.few_shot_layouts, layout])
+    self.scaler.partial_fit(layout.reshape(1, -1))
+    self.save()
   
   def clear(self):
     if os.path.exists(self.cache_file):
@@ -459,9 +477,6 @@ def processDocument(args: Tuple[str, FewShotDocumentProcessor]) -> dict:
       raise ValueError("Extracted text is empty")
     
     category, confidence = analyzer.predict(file_path)
-
-    if category not in CATEGORIES:
-      category = 'other'
 
     result.update({
       'category': category,
