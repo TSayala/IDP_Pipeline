@@ -259,7 +259,7 @@ class FewShotDocumentProcessor:
     self.threshold = 0.1
     self.scaler = None
 
-  def extractFeatures(self, image_path):
+  def extractFeatures(self, image_path, externalize=False):
     try:
       # extract text using OCR
       text, pages = readTifFile(image_path)
@@ -309,11 +309,16 @@ class FewShotDocumentProcessor:
         combined_layout_features = np.mean(layout_features_list, axis=0).reshape(1, -1)
 
       logger.debug(f"Layout shape for {image_path}: {combined_layout_features.shape}")
-      return text, combined_layout_features
-    
+      
+      if externalize:
+        return text, combined_layout_features, len(pages)
+      else:
+        embedding = self.model.encode(text, convert_to_tensor=True)
+        return embedding, combined_layout_features, len(pages)
+
     except Exception as e:
       logger.error(f"Error extracting features: {type(e).__name__} - {str(e)}")
-      return None, np.zeros((1, 6))
+      return None, np.zeros((1, 6)), 0
 
   def loadFewShotExamples(self, csv_path, force_reload=False):
     if not force_reload and self.cache.load():
@@ -327,23 +332,23 @@ class FewShotDocumentProcessor:
       try:
         df = pd.read_csv(csv_path)
         logger.debug(f"Loaded {len(df)} few-shot examples from CSV file")
-        self.few_shot_examples = df.to_dict('records')
-        texts = []
+        self.few_shot_examples = []
+        embeddings = []
         layouts = []
-        categories = []
 
         logger.debug("Extracting features from few-shot examples")
         for _, row in df.iterrows():
-          text, layout = self.extractFeatures(row['file_path'])
-          texts.append(text)
-          layouts.append(layout)
-          categories.append(row['category'])
+          embedding = torch.tensor(eval(row['embedding']))
+          layout = np.array(eval(row['layout']))
+
           self.few_shot_examples.append({
             'file_path': row['file_path'],
-            'text': text,
+            'embedding': embedding,
             'layout': layout,
             'category': row['category']
           })
+          embeddings.append(embedding)
+          layouts.append(layout)
           logger.debug(f"Layout shape for {row['file_path']}: {layout.shape}")
 
         # Check for consistent dimensions
@@ -351,11 +356,7 @@ class FewShotDocumentProcessor:
         if len(set(layout_shapes)) != 1:
           raise ValueError(f"Inconsistent layout dimensions: {layout_shapes}")
 
-        logger.debug("Encoding texts")
-        self.few_shot_embeddings = self.model.encode(texts, convert_to_tensor=True)
-        logger.debug(f"Few-shot embeddings shape: {self.few_shot_embeddings.shape}")
-
-        logger.debug("Stacking layouts")
+        self.few_shot_embeddings = torch.stack(embeddings)
         self.few_shot_layouts = np.vstack(layouts)
         logger.debug(f"Few-shot layouts shape: {self.few_shot_layouts.shape}")
 
@@ -375,25 +376,24 @@ class FewShotDocumentProcessor:
         logger.error(f"Error loading few-shot examples: {type(e).__name__} - {str(e)}")
 
   def updateFewShotExamples(self, image_path, verified_category):
-    text, layout = self.extractFeatures(image_path)
+    embedding, layout = self.extractFeatures(image_path)
     new_example = {
       'file_path': image_path,
-      'text': text,
+      'embedding': embedding,
       'layout': layout,
       'category': verified_category
     }
     self.cache.update(new_example)
 
   def predict(self, image_path):
-    text, layout = self.extractFeatures(image_path)
-    if text is None or layout is None:
+    embedding, layout = self.extractFeatures(image_path)
+    if embedding is None or layout is None:
       return 'Error', 0.0
 
     # Few-shot classification
-    query_embedding = self.model.encode(text, convert_to_tensor=True)
     layout = self.scaler.transform(layout)
 
-    text_scores = util.cos_sim(query_embedding, self.few_shot_embeddings)[0]
+    text_scores = util.cos_sim(embedding, self.few_shot_embeddings)[0]
     layout_distances = np.linalg.norm(self.few_shot_layouts - layout, axis=1)
     layout_scores = 1 / (1 + layout_distances)
 
@@ -481,10 +481,9 @@ class FewShotCache:
   
   def update(self, new_example):
     self.few_shot_examples.append(new_example)
-    text, layout = new_example['text'], new_example['layout']
-    self.few_shot_embeddings = torch.cat([self.few_shot_embeddings, self.model.encode([text], convert_to_tensor=True)])
-    self.few_shot_layouts = np.vstack([self.few_shot_layouts, layout])
-    self.scaler.partial_fit(layout.reshape(1, -1))
+    self.few_shot_embeddings = torch.cat([self.few_shot_embeddings, new_example['embedding'].unsqueeze(0)])
+    self.few_shot_layouts = np.vstack([self.few_shot_layouts, new_example['layout']])
+    self.scaler.partial_fit(new_example['layout'].reshape(1, -1))
     self.save()
   
   def clear(self):
@@ -643,21 +642,16 @@ def processDocument(args: Tuple[str, FewShotDocumentProcessor]) -> dict:
     'confidence': None,
     'status': 'error',
     'error_message': None,
-    'text': None,
-    'text_length': 0,
     'num_pages': 0
   }
 
   try:
     logger.info(f"Processing document {file_path}")
-    document_text, pages = analyzer.extractFeatures(file_path)
-    result['text'] = document_text
-    result['text_length'] = len(document_text)
-    result['num_pages'] = len(pages)
+    embedding, layout, num_pages = analyzer.extractFeatures(file_path)
+    result['num_pages'] = num_pages
 
-    if result['text_length'] == 0:
-      logger.warning(f"File '{file_path}': Extracted text is empty for file: {file_path}")
-      raise ValueError("Extracted text is empty")
+    if embedding is None or layout is None:
+      raise ValueError("Error extracting features from document")
     
     category, confidence = analyzer.predict(file_path)
 
