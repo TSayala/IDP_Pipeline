@@ -5,6 +5,7 @@ import io
 import string
 import json
 import pickle
+import time
 
 import torch
 import torch.nn as nn
@@ -172,46 +173,48 @@ class TextCleaner:
     return '\n'.join(cleaned_lines)
 
 class DocumentPreviewer:
-  def __init__(self, file_path, default_width=800, default_height=600):
-    self.file_path = os.path.abspath(file_path)
-    self.image = Image.open(self.file_path)
+  def __init__(self, default_width=800, default_height=600):
+    self.default_width = default_width
+    self.default_height = default_height
+    self.root = None
+    self.label = None
+    self.image = None
     self.page_index = 0
-    self.num_pages = self.image.n_frames
+    self.num_pages = 0  
 
-    self.root = tk.Tk()
-    self.root.title('Document Previewer - ' + os.path.basename(self.file_path))
-
-    # Set default window dimensions and minimum size
-    self.root.geometry(f"{default_width}x{default_height}")
-    self.root.minsize(200, 200)  # Set a minimum window size
-
-    self.label = tk.Label(self.root)
-    self.label.pack(expand=True, fill=tk.BOTH)
-
-    self.prev_button = tk.Button(self.root, text="Previous", command=self.show_prev_page)
+    """ self.prev_button = tk.Button(self.root, text="Previous", command=self.showPrevPage)
     self.prev_button.pack(side=tk.LEFT)
 
-    self.next_button = tk.Button(self.root, text="Next", command=self.show_next_page)
-    self.next_button.pack(side=tk.RIGHT)
+    self.next_button = tk.Button(self.root, text="Next", command=self.showNextPage)
+    self.next_button.pack(side=tk.RIGHT) """
 
-    self.root.bind('<Configure>', self.on_resize)
+  def show(self, file_path):
+    if self.root is None:
+      self.root = tk.Tk()
+      self.root.title('Document Previewer - ' + os.path.basename(self.file_path))
+      self.root.geometry(f"{self.default_width}x{self.default_height}")
+      self.root.minsize(200, 200)
+      self.label = tk.Label(self.root)
+      self.label.pack(expand=True, fill=tk.BOTH)
+      self.root.bind('<Configure>', self.onResize)
+      # self.file_path = os.path.abspath(file_path)
 
-    self.show_page(self.page_index)
-    self.root.mainloop()
+    self.image = Image.open(file_path)
+    self.num_pages = getattr(self.image, 'n_frames', 1)
+    self.page_index = 0
+    self.showPage(self.page_index)
+    self.root.update()
 
-  def on_resize(self, event):
-      self.show_page(self.page_index)
+  def onResize(self, event):
+    if self.image:
+      self.showPage(self.page_index)
 
-  def show_page(self, index):
-    self.image.seek(index)
-    window_width = self.root.winfo_width()
-    window_height = self.root.winfo_height()
-
-    # Ensure dimensions are greater than zero
-    if window_width <= 0 or window_height <= 0:
-      return
-
-    # Resize the image to fit the window while maintaining aspect ratio
+  def showPage(self, index):
+    if self.image:
+      if hasattr(self.image, 'seek'):
+        self.image.seek(index)
+      window_width = self.root.winfo_width()
+      window_height = self.root.winfo_height()
     aspect_ratio = self.image.width / self.image.height
     if window_width / window_height > aspect_ratio:
       new_height = window_height
@@ -219,31 +222,31 @@ class DocumentPreviewer:
     else:
       new_width = window_width
       new_height = int(window_width / aspect_ratio)
-
-    # Ensure new dimensions are greater than zero
-    if new_width <= 0 or new_height <= 0:
-      return
-
     resized_image = self.image.resize((new_width, new_height-50), Image.LANCZOS)
     photo = ImageTk.PhotoImage(resized_image)
     self.label.config(image=photo)
     self.label.image = photo
 
-  def show_prev_page(self):
+  def showPrevPage(self):
     if self.page_index > 0:
       self.page_index -= 1
-      self.show_page(self.page_index)
+      self.showPage(self.page_index)
 
-  def show_next_page(self):
+  def showNextPage(self):
     if self.page_index < self.num_pages - 1:
       self.page_index += 1
-      self.show_page(self.page_index)
+      self.showPage(self.page_index)
 
-  def close_window(self):
-    self.root.destroy()
+  def closeWindow(self):
+    if self.root:
+      self.root.destroy()
+      self.root = None
 
-def display_image(file_path, default_width=720, default_height=960):
-  viewer = DocumentPreviewer(file_path, default_width, default_height)
+def displayImage(file_path, viewer=None, default_width=720, default_height=960):
+  if viewer is None or not viewer.root.winfo_exists():
+    viewer = DocumentPreviewer(file_path, default_width, default_height)
+  else:
+    viewer.loadDocument(file_path)
   return viewer
 
 class FewShotDocumentProcessor:
@@ -536,8 +539,9 @@ class ActiveLearningIDP:
     y = [example['category'] for example in self.few_shot_processor.few_shot_examples]
     self.learner.fit(X, y)
 
-def userReview(sample, available_categories):
+def userReview(sample, available_categories, previewer):
   file_path, predicted_category, confidence, proba = sample
+  previewer.show(file_path)
   print(f"\nReviewing document: {file_path}")
   print(f"\nInitial prediction: {predicted_category} (Confidence: {confidence:.2f})")
   
@@ -670,7 +674,8 @@ def processAllDocuments(file_paths: List[str], examples: str, batch_size: int = 
   analyzer = FewShotDocumentProcessor(cache=cache)
   analyzer.loadFewShotExamples(examples, force_reload=force_reload)
   alIDP = ActiveLearningIDP(analyzer)
-
+  previewer = DocumentPreviewer()
+ 
   all_results = []
   total_batches = len(file_paths) // batch_size + (1 if len(file_paths) % batch_size else 0)
 
@@ -686,10 +691,11 @@ def processAllDocuments(file_paths: List[str], examples: str, batch_size: int = 
       logger.info(f'Found {len(samples_to_review)} samples to review')
       reviewed_samples = []
       for sample in samples_to_review:
-        reviewed_sample = userReview(sample, alIDP.available_categories)
+        reviewed_sample = userReview(sample, alIDP.available_categories, previewer)
         reviewed_samples.append(reviewed_sample)
       alIDP.updateModel(reviewed_samples)
       logger.info(f'Updated model with {len(reviewed_samples)} reviewed samples')
+      previewer.closeWindow()    
 
   df = pd.DataFrame(all_results)
 
