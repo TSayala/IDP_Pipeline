@@ -17,7 +17,8 @@ from typing import List, Tuple
 import unicodedata
 
 import numpy as np
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageTk, UnidentifiedImageError
+import tkinter as tk
 import pytesseract
 import cv2
 
@@ -26,6 +27,7 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
+from sklearn.base import BaseEstimator, ClassifierMixin
 
 from modAL.models import ActiveLearner
 from modAL.uncertainty import uncertainty_sampling
@@ -168,7 +170,82 @@ class TextCleaner:
     lines = text.splitlines()
     cleaned_lines = [line for line in lines if not self.isHeaderFooter(line)]
     return '\n'.join(cleaned_lines)
-  
+
+class DocumentPreviewer:
+  def __init__(self, file_path, default_width=800, default_height=600):
+    self.file_path = os.path.abspath(file_path)
+    self.image = Image.open(self.file_path)
+    self.page_index = 0
+    self.num_pages = self.image.n_frames
+
+    self.root = tk.Tk()
+    self.root.title('Document Previewer - ' + os.path.basename(self.file_path))
+
+    # Set default window dimensions and minimum size
+    self.root.geometry(f"{default_width}x{default_height}")
+    self.root.minsize(200, 200)  # Set a minimum window size
+
+    self.label = tk.Label(self.root)
+    self.label.pack(expand=True, fill=tk.BOTH)
+
+    self.prev_button = tk.Button(self.root, text="Previous", command=self.show_prev_page)
+    self.prev_button.pack(side=tk.LEFT)
+
+    self.next_button = tk.Button(self.root, text="Next", command=self.show_next_page)
+    self.next_button.pack(side=tk.RIGHT)
+
+    self.root.bind('<Configure>', self.on_resize)
+
+    self.show_page(self.page_index)
+    self.root.mainloop()
+
+  def on_resize(self, event):
+      self.show_page(self.page_index)
+
+  def show_page(self, index):
+    self.image.seek(index)
+    window_width = self.root.winfo_width()
+    window_height = self.root.winfo_height()
+
+    # Ensure dimensions are greater than zero
+    if window_width <= 0 or window_height <= 0:
+      return
+
+    # Resize the image to fit the window while maintaining aspect ratio
+    aspect_ratio = self.image.width / self.image.height
+    if window_width / window_height > aspect_ratio:
+      new_height = window_height
+      new_width = int(window_height * aspect_ratio)
+    else:
+      new_width = window_width
+      new_height = int(window_width / aspect_ratio)
+
+    # Ensure new dimensions are greater than zero
+    if new_width <= 0 or new_height <= 0:
+      return
+
+    resized_image = self.image.resize((new_width, new_height-50), Image.LANCZOS)
+    photo = ImageTk.PhotoImage(resized_image)
+    self.label.config(image=photo)
+    self.label.image = photo
+
+  def show_prev_page(self):
+    if self.page_index > 0:
+      self.page_index -= 1
+      self.show_page(self.page_index)
+
+  def show_next_page(self):
+    if self.page_index < self.num_pages - 1:
+      self.page_index += 1
+      self.show_page(self.page_index)
+
+  def close_window(self):
+    self.root.destroy()
+
+def display_image(file_path, default_width=720, default_height=960):
+  viewer = DocumentPreviewer(file_path, default_width, default_height)
+  return viewer
+
 class FewShotDocumentProcessor:
   def __init__(self, model_name='all-MiniLM-L6-v2', cache=None):
     self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -358,6 +435,19 @@ class FewShotDocumentProcessor:
 
     return category_probs
 
+class FewShotClassifier(BaseEstimator, ClassifierMixin):
+  def __init__(self, few_shot_processor):
+    self.few_shot_processor = few_shot_processor
+
+  def fit(self, X, y):
+    return self
+  
+  def predict(self, X):
+    return [self.few_shot_processor.predict(image_path)[0] for image_path in X]
+  
+  def predict_proba(self, X):
+    return [list(self.few_shot_processor.predictProba(image_path).values()) for image_path in X]
+
 class FewShotCache:
   def __init__(self, cache_file='data/examples/cache/few_shot_cache.pkl'):
     self.cache_file = cache_file
@@ -400,6 +490,76 @@ class FewShotCache:
       logger.info(f"Cache file {self.cache_file} has been removed")
     self.init()
     logger.info("Cache has been cleared")
+
+class ActiveLearningIDP:
+  def __init__(self, few_shot_processor, threshold=0.7):
+    self.few_shot_processor = few_shot_processor
+    self.threshold = threshold
+    self.classifier = FewShotClassifier(few_shot_processor)
+    self.learner = ActiveLearner(
+      estimator=self.classifier,
+      query_strategy=uncertainty_sampling
+    )
+    self.queued_samples = []
+    self.available_categories = set()
+
+  def processDocument(self, file_path):
+    category, confidence = self.few_shot_processor.predict(file_path)
+    proba = self.few_shot_processor.predictProba(file_path)
+
+    self.available_categories.add(category)
+
+    if confidence < self.threshold:
+      self.queued_samples.append((file_path, category, confidence, proba))
+
+    return {
+      'file_path': file_path,
+      'category': category,
+      'confidence': confidence,
+      'needs_review': confidence < self.threshold
+    }
+
+  def fetchSamples(self, n_samples=10):
+    if len(self.queued_samples) < n_samples:
+      return self.queued_samples
+    else:
+      return self.queued_samples[:n_samples]
+    
+  def updateModel(self, reviewed_samples):
+    for file_path, verified_category in reviewed_samples:
+      self.few_shot_processor.updateFewShotExamples(file_path, verified_category)
+      self.available_categories.add(verified_category)
+
+    self.queued_samples = [sample for sample in self.queued_samples if sample[0] not in [rs[0] for rs in reviewed_samples]]
+
+    X = [example['file_path'] for example in self.few_shot_processor.few_shot_examples]
+    y = [example['category'] for example in self.few_shot_processor.few_shot_examples]
+    self.learner.fit(X, y)
+
+def userReview(sample, available_categories):
+  file_path, predicted_category, confidence, proba = sample
+  print(f"\nReviewing document: {file_path}")
+  print(f"\nInitial prediction: {predicted_category} (Confidence: {confidence:.2f})")
+  
+  print("\nAvailable categories:")
+  for i, category in enumerate(available_categories):
+    print(f"{i+1}. {category}")
+  print(f"{len(available_categories)+1}. Other (Write-in)")
+
+  while True:
+    choice = input("\nAccept the prediction? (y) or enter the number of the correct category: ")
+    if choice.lower() == 'y':
+      return file_path, predicted_category
+    try:
+      choice = int(choice)
+      if 1 <= choice <= len(available_categories):
+        return file_path, list(available_categories)[choice-1]
+      elif choice == len(available_categories) + 1:
+        new_category = input("Enter the new category: ")
+        return file_path, new_category
+    except ValueError:
+      pass
+    print("Invalid input. Please enter a valid category number or 'y' to accept the prediction")
 
 def isFaxCover(text: str) -> Tuple[bool, List[Tuple[str, int]]]:
   keywords = ['fax', 'cover', 'sheet', 'attached']
@@ -509,6 +669,7 @@ def processAllDocuments(file_paths: List[str], examples: str, batch_size: int = 
   cache = FewShotCache()
   analyzer = FewShotDocumentProcessor(cache=cache)
   analyzer.loadFewShotExamples(examples, force_reload=force_reload)
+  alIDP = ActiveLearningIDP(analyzer)
 
   all_results = []
   total_batches = len(file_paths) // batch_size + (1 if len(file_paths) % batch_size else 0)
@@ -516,102 +677,21 @@ def processAllDocuments(file_paths: List[str], examples: str, batch_size: int = 
   logger.info(f'Starting to process {len(file_paths)} documents in {total_batches} batches')
   for i, batch in enumerate(batchGenerator(file_paths, batch_size), 1):
     logger.info(f'Processing batch {i}/{total_batches}')
-    batch_results = processBatch(batch, analyzer)
+    batch_results = [alIDP.processDocument(file_path) for file_path in batch] # processBatch(batch, analyzer)
     all_results.extend(batch_results)
     logger.info(f'Completed batch {i}/{total_batches}')
 
+    samples_to_review = alIDP.fetchSamples()
+    if samples_to_review:
+      logger.info(f'Found {len(samples_to_review)} samples to review')
+      reviewed_samples = []
+      for sample in samples_to_review:
+        reviewed_sample = userReview(sample, alIDP.available_categories)
+        reviewed_samples.append(reviewed_sample)
+      alIDP.updateModel(reviewed_samples)
+      logger.info(f'Updated model with {len(reviewed_samples)} reviewed samples')
+
   df = pd.DataFrame(all_results)
-  #
-  """ all_texts = []
-  all_layout_features = []
-  for file_path in df['file_path']:
-    text, layout = analyzer.extractFeatures(file_path)
-    all_texts.append(text)
-    if layout.shape[1] != 6:
-      logger.warning(f"Layout features shape mismatch for file: {file_path}: {layout.shape}. Using default features")
-      layout = np.zeros((1, 6))
-    all_layout_features.append(layout.flatten())
-
-  df['extracted_text'] = all_texts
-  layout_features = np.array(all_layout_features)
-
-  # Active learning
-  features, labels = prepareDataForActiveLearning(df)
-  sample_size = min(100, len(features))
-  if sample_size == 0:
-    logger.error("No features found for active learning")
-    raise ValueError("No features found for active learning")
-  initial_idx = np.random.choice(len(features), size=sample_size, replace=False)
-  active_learner = ActiveLearner(features[initial_idx], labels[initial_idx])
-
-  unlabeled_data = df.drop(df.index[initial_idx])
-  active_learner = activeLearningLoop(active_learner, unlabeled_data)
-
-  al_predictions = active_learner.predict(features)
-  al_probas = active_learner.predictProba(features)
-  df['al_category'] = al_predictions
-  df['al_confidence'] = np.max(al_probas, axis=1)
-
-  # Neural network (SimpleNN)
-  nn_features, nn_labels, num_classes = prepareDataForNeuralNet(df)
-  nn_validator = NeuralNetValidator(input_size=nn_features.shape[1], hidden_size=64, num_classes=num_classes)
-  train_dataset, val_dataset = nn_validator.prepareData(nn_features, nn_labels)
-  nn_validator.train(train_dataset, val_dataset)
-
-  nn_predictions, nn_probas = nn_validator.validate(nn_features)
-  df['nn_category'] = nn_predictions
-  df['nn_confidence'] = np.max(nn_probas, axis=1)
-
-  # CNN-LSTM
-  text_embeddings = np.array([getBertEmbeddings(text) for text in df['extracted_text']])
-
-  few_shot_layout_features = np.array([example['layout'].flatten() for example in cache.few_shot_examples])
-  few_shot_text_embeddings = np.array([getBertEmbeddings(example['text']) for example in cache.few_shot_examples])
-  few_shot_labels = LabelEncoder().fit_transform([example['category'] for example in cache.few_shot_examples])
-
-  combined_layout_features = np.vstack([few_shot_layout_features, layout_features])
-  combined_text_embeddings = np.vstack([few_shot_text_embeddings, text_embeddings])
-  combined_labels = np.concatenate([few_shot_labels, nn_labels])
-
-  dataset = TensorDataset(
-    torch.FloatTensor(combined_layout_features),
-    torch.FloatTensor(combined_text_embeddings),
-    torch.LongTensor(combined_labels)
-  )
-  train_size = int(0.8 * len(dataset))
-  val_size = len(dataset) - train_size
-  train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
-  train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-  val_loader = DataLoader(val_dataset, batch_size=32)
-
-  cnn_lstm_model = CNNLSTM(
-    num_layout_features=combined_layout_features.shape[1],
-    text_embedding_dim=combined_text_embeddings.shape[1],
-    hidden_dim=64,
-    num_classes=len(set(combined_labels))
-  )
-
-  model_file = 'data/models/cnn_lstm_model.pth'
-  if os.path.exists(model_file):
-    cnn_lstm_model.load_state_dict(torch.load(model_file))
-    logger.info(f'Model loaded from file: {model_file}')
-  else:
-    cnn_lstm_model = trainCNNLSTM(cnn_lstm_model, train_loader, val_loader, num_epochs=10, learning_rate=0.001, model_file=model_file)
-
-  cnn_lstm_model.eval()
-  with torch.no_grad():
-    cnn_lstm_outputs = cnn_lstm_model(
-      torch.FloatTensor(layout_features),
-      torch.FloatTensor(text_embeddings)
-    )
-    cnn_lstm_probas = F.softmax(cnn_lstm_outputs, dim=1)
-    cnn_lstm_predictions = torch.argmax(cnn_lstm_probas, dim=1)
-
-  df['cnn_lstm_category'] = cnn_lstm_predictions.cpu().numpy()
-  df['cnn_lstm_confidence'] = torch.max(cnn_lstm_probas, dim=1)[0].cpu().numpy()
-
-  voter = VotingClassifier(threshold=0.6)
-  df['voted_category'], df['voted_confidence'] = zip(*df.apply(lambda row: applyVoting(row, voter), axis=1)) """
 
   logger.info(f'All documents processed and validated successfully. Success: {df['status'].value_counts().get("success", 0)}, Errors: {df['status'].value_counts().get("error", 0)}')
   return df
