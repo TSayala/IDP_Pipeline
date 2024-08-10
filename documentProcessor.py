@@ -53,7 +53,7 @@ CATEGORIES = [
 # Setup logging
 def setupLogger(log_file='document_processor.log'):
   logger = logging.getLogger('DocumentProcessor')
-  logger.setLevel(logging.DEBUG)
+  logger.setLevel(logging.INFO)
 
   # Create handlers
   file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
@@ -308,7 +308,7 @@ class FewShotDocumentProcessor:
       else:                     
         combined_layout_features = np.mean(layout_features_list, axis=0).reshape(1, -1)
 
-      #logger.debug(f"Layout shape for {image_path}: {combined_layout_features.shape}")
+      logger.debug(f"Layout shape for {image_path}: {combined_layout_features.shape}")
       return text, combined_layout_features
     
     except Exception as e:
@@ -344,7 +344,7 @@ class FewShotDocumentProcessor:
             'layout': layout,
             'category': row['category']
           })
-          #logger.debug(f"Layout shape for {row['file_path']}: {layout.shape}")
+          logger.debug(f"Layout shape for {row['file_path']}: {layout.shape}")
 
         # Check for consistent dimensions
         layout_shapes = [layout.shape[1] for layout in layouts]
@@ -495,10 +495,10 @@ class FewShotCache:
     logger.info("Cache has been cleared")
 
 class ActiveLearningIDP:
-  def __init__(self, few_shot_processor, threshold=0.7):
+  def __init__(self, few_shot_processor, threshold=0.5):
     self.few_shot_processor = few_shot_processor
     self.threshold = threshold
-    self.classifier = FewShotClassifier(few_shot_processor)
+    self.classifier = RandomForestClassifier(n_estimators=100, random_state=42)
     self.learner = ActiveLearner(
       estimator=self.classifier,
       query_strategy=uncertainty_sampling
@@ -506,14 +506,32 @@ class ActiveLearningIDP:
     self.queued_samples = []
     self.available_categories = set()
 
-  def processDocument(self, file_path):
-    category, confidence = self.few_shot_processor.predict(file_path)
-    proba = self.few_shot_processor.predictProba(file_path)
+  def fitInitialModel(self):
+    examples = self.few_shot_processor.cache.few_shot_examples
+    X = []
+    y = []
+    for example in examples:
+      text_embedding = self.few_shot_processor.model.encode(example['text'])
+      layout_features = self.few_shot_processor.scaler.transform(example['layout']).reshape(1, -1).flatten()
+      features = np.concatenate([text_embedding, layout_features])
+      X.append(features)
+      y.append(example['category'])
+      self.available_categories.add(example['category'])
 
-    self.available_categories.add(category)
+    self.learner.fit(X, y)
+
+  def processDocument(self, file_path):
+    text, layout = self.few_shot_processor.extractFeatures(file_path)
+
+    text_embedding = self.few_shot_processor.model.encode(text)
+    layout_features = self.few_shot_processor.scaler.transform(layout)
+    features = np.concatenate([text_embedding, layout_features.flatten()])
+
+    category = self.learner.predict([features])[0]
+    confidence = np.max(self.learner.predict_proba([features])[0])
 
     if confidence < self.threshold:
-      self.queued_samples.append((file_path, category, confidence, proba))
+      self.queued_samples.append((features, file_path, text, layout, category, confidence))
 
     return {
       'file_path': file_path,
@@ -529,18 +547,19 @@ class ActiveLearningIDP:
       return self.queued_samples[:n_samples]
     
   def updateModel(self, reviewed_samples):
-    for file_path, verified_category in reviewed_samples:
-      self.few_shot_processor.updateFewShotExamples(file_path, verified_category)
+    new_X = []
+    new_y = []
+    for features, file_path, text, layout, verified_category in reviewed_samples:
+      new_X.append(features)
+      new_y.append(verified_category)
       self.available_categories.add(verified_category)
 
-    self.queued_samples = [sample for sample in self.queued_samples if sample[0] not in [rs[0] for rs in reviewed_samples]]
-
-    X = [example['file_path'] for example in self.few_shot_processor.few_shot_examples]
-    y = [example['category'] for example in self.few_shot_processor.few_shot_examples]
-    self.learner.fit(X, y)
+      self.few_shot_processor.updateFewShotExamples(file_path, verified_category)
+    self.fitInitialModel()
+    self.queued_samples = [sample for sample in self.queued_samples if sample[1] not in [rs[1] for rs in reviewed_samples]]
 
 def userReview(sample, available_categories, previewer):
-  file_path, predicted_category, confidence, proba = sample
+  features, file_path, text, layout, predicted_category, confidence = sample
   previewer.show(file_path)
   print(f"\nReviewing document: {file_path}")
   print(f"\nInitial prediction: {predicted_category} (Confidence: {confidence:.2f})")
@@ -553,14 +572,14 @@ def userReview(sample, available_categories, previewer):
   while True:
     choice = input("\nAccept the prediction? (y) or enter the number of the correct category: ")
     if choice.lower() == 'y':
-      return file_path, predicted_category
+      return features, file_path, text, layout, predicted_category
     try:
       choice = int(choice)
       if 1 <= choice <= len(available_categories):
-        return file_path, list(available_categories)[choice-1]
+        return features, file_path, text, layout, list(available_categories)[choice-1]
       elif choice == len(available_categories) + 1:
         new_category = input("Enter the new category: ")
-        return file_path, new_category
+        return features, file_path, text, layout, new_category
     except ValueError:
       pass
     print("Invalid input. Please enter a valid category number or 'y' to accept the prediction")
@@ -600,7 +619,7 @@ def readTifFile(file_path: str) -> Tuple[str, List[np.ndarray]]:
         if i == 0 and img.n_frames > 1:
           is_fax_cover, matched_keywords = isFaxCover(text)
           if is_fax_cover:
-            logger.info(f"File '{file_path}': Detected a fax cover page. Keywords: {matched_keywords}")
+            logger.debug(f"File '{file_path}': Detected a fax cover page. Keywords: {matched_keywords}")
             continue
         texts.append(text)
         pages.append(np_image)
@@ -674,6 +693,7 @@ def processAllDocuments(file_paths: List[str], examples: str, batch_size: int = 
   analyzer = FewShotDocumentProcessor(cache=cache)
   analyzer.loadFewShotExamples(examples, force_reload=force_reload)
   alIDP = ActiveLearningIDP(analyzer)
+  alIDP.fitInitialModel()
   previewer = DocumentPreviewer()
  
   all_results = []
