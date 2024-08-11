@@ -259,7 +259,7 @@ class FewShotDocumentProcessor:
     self.threshold = 0.1
     self.scaler = None
 
-  def extractFeatures(self, image_path, externalize=False):
+  def extractFeatures(self, image_path, use_text=False):
     try:
       # extract text using OCR
       text, pages = readTifFile(image_path)
@@ -310,7 +310,7 @@ class FewShotDocumentProcessor:
 
       logger.debug(f"Layout shape for {image_path}: {combined_layout_features.shape}")
       
-      if externalize:
+      if use_text:
         return text, combined_layout_features, len(pages)
       else:
         embedding = self.model.encode(text, convert_to_tensor=True)
@@ -507,36 +507,62 @@ class ActiveLearningIDP:
 
   def fitInitialModel(self):
     examples = self.few_shot_processor.cache.few_shot_examples
+    if not examples:
+      logger.error("No few-shot examples found. Model cannot be trained")
+      raise ValueError("No few-shot examples found to fit the initial model")
+    
     X = []
     y = []
     for example in examples:
-      text_embedding = self.few_shot_processor.model.encode(example['text'])
+      if 'embedding' not in example or 'layout' not in example or 'category' not in example:
+        logger.error(f"Skipping invalid few-shot example: {example}")
+        continue
+
+      text_embedding = example['embedding'].cpu().numpy() #.flatten()
       layout_features = self.few_shot_processor.scaler.transform(example['layout']).reshape(1, -1).flatten()
       features = np.concatenate([text_embedding, layout_features])
       X.append(features)
       y.append(example['category'])
       self.available_categories.add(example['category'])
 
+    if not X or not y:
+      logger.error("No valid few-shot examples found. Model cannot be trained")
+      raise ValueError("No valid few-shot examples found to fit the initial model")
+    
+    logger.info(f"Fitting initial model with {len(X)} few-shot examples")
     self.learner.fit(X, y)
 
   def processDocument(self, file_path):
-    text, layout = self.few_shot_processor.extractFeatures(file_path)
+    embedding, layout, num_pages = self.few_shot_processor.extractFeatures(file_path)
 
-    text_embedding = self.few_shot_processor.model.encode(text)
-    layout_features = self.few_shot_processor.scaler.transform(layout)
-    features = np.concatenate([text_embedding, layout_features.flatten()])
+    if embedding is None or layout is None:
+      return {
+        'file_path': file_path,
+        'category': 'Error',
+        'confidence': 0.0,
+        'needs_review': True,
+        'num_pages': num_pages,
+        'status': 'error',
+        'error_message': 'Error extracting features'
+      }
+
+    embedding_np = embedding.cpu().numpy()
+    layout_features = self.few_shot_processor.scaler.transform(layout).flatten()
+    features = np.concatenate([embedding_np, layout_features])
 
     category = self.learner.predict([features])[0]
     confidence = np.max(self.learner.predict_proba([features])[0])
 
     if confidence < self.threshold:
-      self.queued_samples.append((features, file_path, text, layout, category, confidence))
+      self.queued_samples.append((features, file_path, embedding, layout, category, confidence))
 
     return {
       'file_path': file_path,
       'category': category,
       'confidence': confidence,
-      'needs_review': confidence < self.threshold
+      'needs_review': confidence < self.threshold,
+      'num_pages': num_pages,
+      'status': 'success'
     }
 
   def fetchSamples(self, n_samples=10):
@@ -548,17 +574,17 @@ class ActiveLearningIDP:
   def updateModel(self, reviewed_samples):
     new_X = []
     new_y = []
-    for features, file_path, text, layout, verified_category in reviewed_samples:
+    for features, file_path, embedding, layout, verified_category in reviewed_samples:
       new_X.append(features)
       new_y.append(verified_category)
       self.available_categories.add(verified_category)
 
       self.few_shot_processor.updateFewShotExamples(file_path, verified_category)
-    self.fitInitialModel()
+    self.learner.teach(new_X, new_y)
     self.queued_samples = [sample for sample in self.queued_samples if sample[1] not in [rs[1] for rs in reviewed_samples]]
 
 def userReview(sample, available_categories, previewer):
-  features, file_path, text, layout, predicted_category, confidence = sample
+  features, file_path, embedding, layout, predicted_category, confidence = sample
   previewer.show(file_path)
   print(f"\nReviewing document: {file_path}")
   print(f"\nInitial prediction: {predicted_category} (Confidence: {confidence:.2f})")
@@ -571,14 +597,14 @@ def userReview(sample, available_categories, previewer):
   while True:
     choice = input("\nAccept the prediction? (y) or enter the number of the correct category: ")
     if choice.lower() == 'y':
-      return features, file_path, text, layout, predicted_category
+      return features, file_path, embedding, layout, predicted_category
     try:
       choice = int(choice)
       if 1 <= choice <= len(available_categories):
-        return features, file_path, text, layout, list(available_categories)[choice-1]
+        return features, file_path, embedding, layout, list(available_categories)[choice-1]
       elif choice == len(available_categories) + 1:
         new_category = input("Enter the new category: ")
-        return features, file_path, text, layout, new_category
+        return features, file_path, embedding, layout, new_category
     except ValueError:
       pass
     print("Invalid input. Please enter a valid category number or 'y' to accept the prediction")
@@ -686,8 +712,12 @@ def processAllDocuments(file_paths: List[str], examples: str, batch_size: int = 
   cache = FewShotCache()
   analyzer = FewShotDocumentProcessor(cache=cache)
   analyzer.loadFewShotExamples(examples, force_reload=force_reload)
-  alIDP = ActiveLearningIDP(analyzer)
-  alIDP.fitInitialModel()
+  try:
+    alIDP = ActiveLearningIDP(analyzer)
+    alIDP.fitInitialModel()
+  except ValueError as e:
+    logger.error(f"Error initializing Active Learning IDP: {str(e)}")
+    return pd.DataFrame(columns=['file_path', 'category', 'confidence', 'status', 'error_message', 'num_pages'])
   previewer = DocumentPreviewer()
  
   all_results = []
