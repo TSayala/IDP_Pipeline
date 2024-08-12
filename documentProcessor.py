@@ -272,8 +272,9 @@ class DocumentPreviewer:
     self.root = None
     self.label = None
     self.image = None
+    self.photo = None
     self.page_index = 0
-    self.num_pages = 0  
+    self.num_pages = 0
 
   def show(self, file_path):
     if self.root is None:
@@ -281,49 +282,70 @@ class DocumentPreviewer:
       self.root.title('Document Previewer - ' + os.path.basename(file_path))
       self.root.geometry(f"{self.default_width}x{self.default_height}")
       self.root.minsize(200, 200)
-      self.label = tk.Label(self.root)
-      self.label.pack(expand=True, fill=tk.BOTH)
-      self.prev_button = tk.Button(self.root, text="Previous", command=self.showPrevPage)
-      self.prev_button.pack(side=tk.LEFT)
-      self.next_button = tk.Button(self.root, text="Next", command=self.showNextPage)
-      self.next_button.pack(side=tk.RIGHT)
-      self.root.bind('<Configure>', self.onResize)
-      # self.file_path = os.path.abspath(file_path)
 
-    self.image = Image.open(file_path)
-    self.num_pages = getattr(self.image, 'n_frames', 1)
-    self.page_index = 0
-    self.showPage(self.page_index)
-    self.root.update()
+      self.canvas = tk.Canvas(self.root)
+      self.canvas.pack(expand=True, fill=tk.BOTH)
+
+      button_frame = tk.Frame(self.root)
+      button_frame.pack(side=tk.BOTTOM, fill=tk.X)
+
+      self.prev_button = tk.Button(button_frame, text="Previous", command=self.showPrevPage)
+      self.prev_button.pack(side=tk.LEFT)
+      self.next_button = tk.Button(button_frame, text="Next", command=self.showNextPage)
+      self.next_button.pack(side=tk.RIGHT)
+      
+      self.root.update_idletasks()
+      self.root.bind('<Configure>', self.onResize)
+
+    try:
+      self.image = Image.open(file_path)
+      self.num_pages = getattr(self.image, 'n_frames', 1)
+      self.page_index = 0
+      self.showPage(self.page_index)
+    except Exception as e:
+      logger.error(f"Error loading image: {type(e).__name__} - {str(e)}")
+      self.showError(f"Error loading image: {type(e).__name__} - {str(e)}")
 
   def onResize(self, event):
     if self.image:
       self.showPage(self.page_index)
 
   def showPage(self, index):
-    if self.image:
-      #if hasattr(self.image, 'seek'):
+    if not self.image:
+      return
+    try:
       self.image.seek(index)
-      window_width = self.root.winfo_width()
-      window_height = self.root.winfo_height()
-      if window_width <= 0 or window_height <= 0:
-        logger.error(f"Invalid dimensions for window: {window_width}x{window_height}")
-        return
-      aspect_ratio = self.image.width / self.image.height
-      if window_width / window_height > aspect_ratio:
-        new_height = window_height
-        new_width = int(window_height * aspect_ratio)
-      else:
-        new_width = window_width
-        new_height = int(window_width / aspect_ratio)
-      if new_width <= 0 or new_height <= 0:
-        logger.error(f"Invalid dimensions for image: {new_width}x{new_height}")
-        return
-      resized_image = self.image.resize((new_width, new_height-50), Image.LANCZOS)
-      photo = ImageTk.PhotoImage(resized_image)
-      self.label.config(image=photo)
-      self.label.image = photo
-        
+      self.resizeAndDisplay()
+    except Exception as e:
+      logger.error(f"Error displaying page: {index} - {type(e).__name__} - {str(e)}")
+      self.showError(f"Error displaying page: {index} - {type(e).__name__} - {str(e)}")
+
+  def resizeAndDisplay(self):
+    window_width = self.canvas.winfo_width()
+    window_height = self.canvas.winfo_height()
+    if window_width <= 1 or window_height <= 1:
+      logger.warning(f"Invalid window size: {window_width}x{window_height}")
+      return
+    logger.debug(f"Window size: {window_width}x{window_height}")
+    img_width, img_height = self.image.size
+    scale = min(window_width / img_width, window_height / img_height)
+    new_width = int(img_width * scale)
+    new_height = int(img_height * scale)
+    logger.debug(f"Resized image size: {new_width}x{new_height}")
+    try:
+      resized_image = self.image.resize((new_width, new_height), Image.LANCZOS)
+      self.photo = ImageTk.PhotoImage(resized_image)
+      self.canvas.delete('all')
+      self.canvas.create_image(window_width / 2, window_height / 2, anchor=tk.CENTER, image=self.photo)
+    except Exception as e:
+      logger.error(f"Error resizing image: {type(e).__name__} - {str(e)}")
+      self.showError(f"Error resizing image: {type(e).__name__} - {str(e)}")
+
+  def showError(self, message):
+    if self.canvas:
+      self.canvas.delete('all')
+      self.canvas.create_text(self.canvas.winfo_width() / 2, self.canvas.winfo_height() / 2, text=message, font=('Arial', 16), anchor=tk.CENTER)
+
   def showPrevPage(self):
     if self.page_index > 0:
       self.page_index -= 1
