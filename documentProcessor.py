@@ -41,19 +41,25 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import logging
 from logging.handlers import RotatingFileHandler
 
-# Change this to match the number of available CPU cores
-NUM_WORKERS = 6
+NUM_WORKERS = 6 # Change this to match the number of available CPU cores
 CATEGORIES = [
   'plan of care', 'discharge summary', 'prescription request',
   'progress note', 'prior authorization', 'lab results',
   'result notification', 'formal records request', 'patient chart note',
   'return to work', 'answering service', 'spam', 'other'
-]
+] # Unused
 
 # Setup logging
 def setupLogger(log_file='document_processor.log'):
+  """
+  Set up a logger with file and console handlers.
+  Parameters:
+  - log_file (str): The path to the log file. Default is 'document_processor.log'.
+  Returns:
+  - logger (logging.Logger): The configured logger object.
+  """
   logger = logging.getLogger('DocumentProcessor')
-  logger.setLevel(logging.INFO)
+  logger.setLevel(logging.DEBUG)
 
   # Create handlers
   file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
@@ -72,6 +78,12 @@ def setupLogger(log_file='document_processor.log'):
   return logger
 _logger = setupLogger()
 def getLogger():
+  """
+  Returns the logger object.
+
+  Returns:
+    The logger object.
+  """
   global _logger
   return _logger
 logger = getLogger()
@@ -91,7 +103,14 @@ class TextCleaner:
 
   def clean(self, text: str) -> str:
     """
-    Main method to clean the input text using a series of cleaning steps.
+    Cleans the given text by removing special characters, header and footer, fixing line breaks,
+    removing extra whitespace, and returns the cleaned text.
+
+    Parameters:
+    text (str): The text to be cleaned.
+
+    Returns:
+    str: The cleaned text.
     """
     #text = self.removeNonPrintableChars(text)
     text = self.removeSpecialChars(text)
@@ -105,13 +124,25 @@ class TextCleaner:
     
   def removeNonPrintableChars(self, text: str) -> str:
     """
-    Remove non-printable characters from the input text.
+    Removes non-printable characters from the given text.
+
+    Parameters:
+    - text (str): The input text.
+
+    Returns:
+    - str: The text with non-printable characters removed.
     """
     return ''.join(ch for ch in text if ch.isprintable())
   
   def fixLineBreaks(self, text: str) -> str:
     """
-    Fix inconsistent line breaks and remove unnecessary ones.
+    Removes leading and trailing whitespaces from each line in the given text and joins them into a single string.
+
+    Args:
+      text (str): The input text containing multiple lines.
+
+    Returns:
+      str: The modified text with leading and trailing whitespaces removed from each line and joined into a single string.
     """
     lines = text.splitlines()
     fixed_lines = []
@@ -122,13 +153,25 @@ class TextCleaner:
   
   def removeExtraWhitespace(self, text: str) -> str:
     """
-    Remove extra whitespace characters from the input text.
+    Removes extra whitespace from the given text.
+
+    Args:
+      text (str): The input text.
+
+    Returns:
+      str: The text with extra whitespace removed.
     """
     return ' '.join(text.split())
   
   def correctCommonErrors(self, text: str) -> str:
     """
-    Correct common OCR misrecognition errors.
+    Corrects common OCR errors in the given text.
+
+    Args:
+      text (str): The text to be corrected.
+
+    Returns:
+      str: The corrected text.
     """
     for error, correction in self.common_errors.items():
       text = text.replace(error, correction)
@@ -136,13 +179,25 @@ class TextCleaner:
   
   def removeSpecialChars(self, text: str) -> str:
     """
-    Remove special characters from the input text while keeping basic punctuation.
+    Removes special characters from the given text.
+
+    Parameters:
+    - text (str): The input text.
+
+    Returns:
+    - str: The text with special characters removed.
     """
     return re.sub(r'[^a-zA-Z0-9\s.,!?/-]', '', text)
   
   def normalizeUnicode(self, text: str) -> str:
     """
-    Normalize Unicode characters to their closest ASCII equivalents.
+    Normalizes the given text by removing any Unicode characters and converting them to ASCII.
+
+    Args:
+      text (str): The input text to be normalized.
+
+    Returns:
+      str: The normalized text with Unicode characters removed and converted to ASCII.
     """
     return unicodedata.normalize('NFKD', text).encode('ASCII', 'ignore').decode('ASCII')
   
@@ -154,7 +209,19 @@ class TextCleaner:
   
   def correctWordSplits(self, text: str) -> str:
     """
-    Correct words that have been split incorrectly by OCR.
+    Corrects word splits in the given text.
+
+    Args:
+      text (str): The input text with potential word splits.
+
+    Returns:
+      str: The corrected text with word splits removed.
+
+    Example:
+      >>> processor = DocumentProcessor()
+      >>> text = "This is a test-\ning example."
+      >>> processor.correctWordSplits(text)
+      'This is a testing example.'
     """
     return re.sub(r'(\w+)-\s*\n\s*(\w+)', r'\1\2', text)
   
@@ -173,7 +240,33 @@ class TextCleaner:
     return '\n'.join(cleaned_lines)
 
 class DocumentPreviewer:
-  def __init__(self, default_width=800, default_height=600):
+  """
+  A class that provides a GUI for previewing documents.
+  Attributes:
+    default_width (int): The default width of the preview window.
+    default_height (int): The default height of the preview window.
+    root (tkinter.Tk): The root window of the previewer.
+    label (tkinter.Label): The label widget for displaying the document image.
+    image (PIL.Image.Image): The current image being displayed.
+    page_index (int): The index of the current page being displayed.
+    num_pages (int): The total number of pages in the document.
+  Methods:
+    __init__(self, default_width=800, default_height=600):
+      Initializes a new instance of the DocumentPreviewer class.
+    show(self, file_path):
+      Displays the document preview for the specified file path.
+    onResize(self, event):
+      Event handler for resizing the preview window.
+    showPage(self, index):
+      Displays the specified page of the document.
+    showPrevPage(self):
+      Displays the previous page of the document.
+    showNextPage(self):
+      Displays the next page of the document.
+    closeWindow(self):
+      Closes the preview window.
+  """
+  def __init__(self, default_width=800, default_height=1000):
     self.default_width = default_width
     self.default_height = default_height
     self.root = None
@@ -182,20 +275,18 @@ class DocumentPreviewer:
     self.page_index = 0
     self.num_pages = 0  
 
-    """ self.prev_button = tk.Button(self.root, text="Previous", command=self.showPrevPage)
-    self.prev_button.pack(side=tk.LEFT)
-
-    self.next_button = tk.Button(self.root, text="Next", command=self.showNextPage)
-    self.next_button.pack(side=tk.RIGHT) """
-
   def show(self, file_path):
     if self.root is None:
       self.root = tk.Tk()
-      self.root.title('Document Previewer - ' + os.path.basename(self.file_path))
+      self.root.title('Document Previewer - ' + os.path.basename(file_path))
       self.root.geometry(f"{self.default_width}x{self.default_height}")
       self.root.minsize(200, 200)
       self.label = tk.Label(self.root)
       self.label.pack(expand=True, fill=tk.BOTH)
+      self.prev_button = tk.Button(self.root, text="Previous", command=self.showPrevPage)
+      self.prev_button.pack(side=tk.LEFT)
+      self.next_button = tk.Button(self.root, text="Next", command=self.showNextPage)
+      self.next_button.pack(side=tk.RIGHT)
       self.root.bind('<Configure>', self.onResize)
       # self.file_path = os.path.abspath(file_path)
 
@@ -211,22 +302,28 @@ class DocumentPreviewer:
 
   def showPage(self, index):
     if self.image:
-      if hasattr(self.image, 'seek'):
-        self.image.seek(index)
+      #if hasattr(self.image, 'seek'):
+      self.image.seek(index)
       window_width = self.root.winfo_width()
       window_height = self.root.winfo_height()
-    aspect_ratio = self.image.width / self.image.height
-    if window_width / window_height > aspect_ratio:
-      new_height = window_height
-      new_width = int(window_height * aspect_ratio)
-    else:
-      new_width = window_width
-      new_height = int(window_width / aspect_ratio)
-    resized_image = self.image.resize((new_width, new_height-50), Image.LANCZOS)
-    photo = ImageTk.PhotoImage(resized_image)
-    self.label.config(image=photo)
-    self.label.image = photo
-
+      if window_width <= 0 or window_height <= 0:
+        logger.error(f"Invalid dimensions for window: {window_width}x{window_height}")
+        return
+      aspect_ratio = self.image.width / self.image.height
+      if window_width / window_height > aspect_ratio:
+        new_height = window_height
+        new_width = int(window_height * aspect_ratio)
+      else:
+        new_width = window_width
+        new_height = int(window_width / aspect_ratio)
+      if new_width <= 0 or new_height <= 0:
+        logger.error(f"Invalid dimensions for image: {new_width}x{new_height}")
+        return
+      resized_image = self.image.resize((new_width, new_height-50), Image.LANCZOS)
+      photo = ImageTk.PhotoImage(resized_image)
+      self.label.config(image=photo)
+      self.label.image = photo
+        
   def showPrevPage(self):
     if self.page_index > 0:
       self.page_index -= 1
@@ -243,6 +340,18 @@ class DocumentPreviewer:
       self.root = None
 
 def displayImage(file_path, viewer=None, default_width=720, default_height=960):
+  """
+  Displays an image using a document viewer.
+
+  Args:
+  - file_path (str): The path to the image file.
+  - viewer (DocumentPreviewer, optional): The document viewer to use. If not provided or None, a new viewer will be created.
+  - default_width (int, optional): The default width of the viewer window. Default is 720.
+  - default_height (int, optional): The default height of the viewer window. Default is 960.
+
+  Returns:
+  - viewer (DocumentPreviewer): The document viewer used to display the image.
+  """
   if viewer is None or not viewer.root.winfo_exists():
     viewer = DocumentPreviewer(file_path, default_width, default_height)
   else:
@@ -250,6 +359,31 @@ def displayImage(file_path, viewer=None, default_width=720, default_height=960):
   return viewer
 
 class FewShotDocumentProcessor:
+  """
+  Class for processing documents using a few-shot learning approach.
+  Args:
+    model_name (str): The name of the SentenceTransformer model to use for text encoding. Default is 'all-MiniLM-L6-v2'.
+    cache (object): An optional cache object to store and retrieve few-shot examples. Default is None.
+  Attributes:
+    device (str): The device (CPU or GPU) on which the model is loaded.
+    model (object): The SentenceTransformer model used for text encoding.
+    cache (object): The cache object for storing and retrieving few-shot examples.
+    text_weight (float): The weight assigned to text similarity in the combined scores. Default is 0.7.
+    layout_weight (float): The weight assigned to layout similarity in the combined scores. Default is 0.3.
+    threshold (float): The threshold for considering a category prediction. Default is 0.1.
+    scaler (object): The scaler object used for scaling layout features.
+  Methods:
+    extractFeatures(image_path):
+      Extracts text and layout features from an image.
+    loadFewShotExamples(csv_path, force_reload=False):
+      Loads few-shot examples from a CSV file or cache.
+    updateFewShotExamples(image_path, verified_category):
+      Updates the few-shot examples with a new example.
+    predict(image_path):
+      Predicts the category of an image using few-shot classification.
+    predictProba(image_path):
+      Predicts the category probabilities of an image using few-shot classification.
+  """
   def __init__(self, model_name='all-MiniLM-L6-v2', cache=None):
     self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     self.model = SentenceTransformer(model_name).to(self.device)
@@ -327,7 +461,7 @@ class FewShotDocumentProcessor:
       try:
         df = pd.read_csv(csv_path)
         logger.debug(f"Loaded {len(df)} few-shot examples from CSV file")
-        self.few_shot_examples = df.to_dict('records')
+        self.few_shot_examples = []
         texts = []
         layouts = []
         categories = []
@@ -340,9 +474,9 @@ class FewShotDocumentProcessor:
           categories.append(row['category'])
           self.few_shot_examples.append({
             'file_path': row['file_path'],
+            'category': row['category'],
             'text': text,
-            'layout': layout,
-            'category': row['category']
+            'layout': layout
           })
           logger.debug(f"Layout shape for {row['file_path']}: {layout.shape}")
 
@@ -378,9 +512,9 @@ class FewShotDocumentProcessor:
     text, layout = self.extractFeatures(image_path)
     new_example = {
       'file_path': image_path,
+      'category': verified_category,
       'text': text,
-      'layout': layout,
-      'category': verified_category
+      'layout': layout
     }
     self.cache.update(new_example)
 
@@ -495,7 +629,25 @@ class FewShotCache:
     logger.info("Cache has been cleared")
 
 class ActiveLearningIDP:
-  def __init__(self, few_shot_processor, threshold=0.5):
+  """
+  ActiveLearningIDP class for processing documents using active learning.
+  Args:
+    few_shot_processor (object): The few-shot processor object.
+    threshold (float, optional): The confidence threshold for determining if a document needs review. Defaults to 0.5.
+  Attributes:
+    few_shot_processor (object): The few-shot processor object.
+    threshold (float): The confidence threshold for determining if a document needs review.
+    classifier (object): The random forest classifier.
+    learner (object): The active learner object.
+    queued_samples (list): A list of queued samples.
+    available_categories (set): A set of available categories.
+  Methods:
+    fitInitialModel: Fits the initial model using the few-shot examples.
+    processDocument: Processes a document and returns the result.
+    fetchSamples: Fetches a specified number of samples from the queued samples.
+    updateModel: Updates the model using the reviewed samples.
+  """
+  def __init__(self, few_shot_processor, threshold=0.7):
     self.few_shot_processor = few_shot_processor
     self.threshold = threshold
     self.classifier = RandomForestClassifier(n_estimators=100, random_state=42)
@@ -521,24 +673,42 @@ class ActiveLearningIDP:
     self.learner.fit(X, y)
 
   def processDocument(self, file_path):
-    text, layout = self.few_shot_processor.extractFeatures(file_path)
-
-    text_embedding = self.few_shot_processor.model.encode(text)
-    layout_features = self.few_shot_processor.scaler.transform(layout)
-    features = np.concatenate([text_embedding, layout_features.flatten()])
-
-    category = self.learner.predict([features])[0]
-    confidence = np.max(self.learner.predict_proba([features])[0])
-
-    if confidence < self.threshold:
-      self.queued_samples.append((features, file_path, text, layout, category, confidence))
-
-    return {
+    result = {
       'file_path': file_path,
-      'category': category,
-      'confidence': confidence,
-      'needs_review': confidence < self.threshold
+      'category': None,
+      'confidence': None,
+      'needs_review': False,
+      'status': 'error',
+      'error_message': None,
+      'text': None
     }
+    try:
+      logger.info(f"Processing document {file_path}")
+      text, layout = self.few_shot_processor.extractFeatures(file_path)
+      result['text'] = text
+
+      text_embedding = self.few_shot_processor.model.encode(text)
+      layout_features = self.few_shot_processor.scaler.transform(layout)
+      features = np.concatenate([text_embedding, layout_features.flatten()])
+
+      category = self.learner.predict([features])[0]
+      confidence = np.max(self.learner.predict_proba([features])[0])
+
+      if confidence < self.threshold:
+        self.queued_samples.append((features, file_path, text, layout, category, confidence))
+
+      result.update({
+        'category': category,
+        'confidence': confidence,
+        'needs_review': confidence < self.threshold,
+        'status': 'success' if category else 'partial success'
+      })
+      logger.info(f"File '{file_path}': Processing complete (Status: {result["status"]})")
+    except Exception as e:
+      logger.error(f"File '{file_path}': Error processing document: {type(e).__name__} - {str(e)}")
+      result['error_message'] = f'{type(e).__name__} - {str(e)}'
+
+    return result
 
   def fetchSamples(self, n_samples=10):
     if len(self.queued_samples) < n_samples:
@@ -634,7 +804,7 @@ def readTifFile(file_path: str) -> Tuple[str, List[np.ndarray]]:
     logger.error(f"File '{file_path}': Unexpected error reading file: {str(e)}")
     raise
 
-def processDocument(args: Tuple[str, FewShotDocumentProcessor]) -> dict:
+def processOneDocument(args: Tuple[str, FewShotDocumentProcessor]) -> dict:
   file_path, analyzer = args
 
   result = {
@@ -677,7 +847,7 @@ def processDocument(args: Tuple[str, FewShotDocumentProcessor]) -> dict:
 def processBatch(batch: List[str], analyzer: FewShotDocumentProcessor) -> List[dict]:
   results = []
   with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
-    future_to_file = {executor.submit(processDocument, (file_path, analyzer)): file_path for file_path in batch}
+    future_to_file = {executor.submit(processOneDocument, (file_path, analyzer)): file_path for file_path in batch}
     for future in as_completed(future_to_file):
       result = future.result()
       results.append(result)
