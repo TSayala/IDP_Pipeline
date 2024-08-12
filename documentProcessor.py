@@ -51,13 +51,6 @@ CATEGORIES = [
 
 # Setup logging
 def setupLogger(log_file='document_processor.log'):
-  """
-  Set up a logger with file and console handlers.
-  Parameters:
-  - log_file (str): The path to the log file. Default is 'document_processor.log'.
-  Returns:
-  - logger (logging.Logger): The configured logger object.
-  """
   logger = logging.getLogger('DocumentProcessor')
   logger.setLevel(logging.DEBUG)
 
@@ -78,12 +71,6 @@ def setupLogger(log_file='document_processor.log'):
   return logger
 _logger = setupLogger()
 def getLogger():
-  """
-  Returns the logger object.
-
-  Returns:
-    The logger object.
-  """
   global _logger
   return _logger
 logger = getLogger()
@@ -102,16 +89,6 @@ class TextCleaner:
     }
 
   def clean(self, text: str) -> str:
-    """
-    Cleans the given text by removing special characters, header and footer, fixing line breaks,
-    removing extra whitespace, and returns the cleaned text.
-
-    Parameters:
-    text (str): The text to be cleaned.
-
-    Returns:
-    str: The cleaned text.
-    """
     #text = self.removeNonPrintableChars(text)
     text = self.removeSpecialChars(text)
     text = self.removeHeaderFooter(text)
@@ -123,15 +100,6 @@ class TextCleaner:
     return text
     
   def removeNonPrintableChars(self, text: str) -> str:
-    """
-    Removes non-printable characters from the given text.
-
-    Parameters:
-    - text (str): The input text.
-
-    Returns:
-    - str: The text with non-printable characters removed.
-    """
     return ''.join(ch for ch in text if ch.isprintable())
   
   def fixLineBreaks(self, text: str) -> str:
@@ -240,32 +208,6 @@ class TextCleaner:
     return '\n'.join(cleaned_lines)
 
 class DocumentPreviewer:
-  """
-  A class that provides a GUI for previewing documents.
-  Attributes:
-    default_width (int): The default width of the preview window.
-    default_height (int): The default height of the preview window.
-    root (tkinter.Tk): The root window of the previewer.
-    label (tkinter.Label): The label widget for displaying the document image.
-    image (PIL.Image.Image): The current image being displayed.
-    page_index (int): The index of the current page being displayed.
-    num_pages (int): The total number of pages in the document.
-  Methods:
-    __init__(self, default_width=800, default_height=600):
-      Initializes a new instance of the DocumentPreviewer class.
-    show(self, file_path):
-      Displays the document preview for the specified file path.
-    onResize(self, event):
-      Event handler for resizing the preview window.
-    showPage(self, index):
-      Displays the specified page of the document.
-    showPrevPage(self):
-      Displays the previous page of the document.
-    showNextPage(self):
-      Displays the next page of the document.
-    closeWindow(self):
-      Closes the preview window.
-  """
   def __init__(self, default_width=800, default_height=1000):
     self.default_width = default_width
     self.default_height = default_height
@@ -297,11 +239,17 @@ class DocumentPreviewer:
       self.root.update_idletasks()
       self.root.bind('<Configure>', self.onResize)
 
+      self.root.mainloop()
+    
+    self.updateDocument(file_path)
+
+  def updateDocument(self, file_path):
     try:
       self.image = Image.open(file_path)
       self.num_pages = getattr(self.image, 'n_frames', 1)
       self.page_index = 0
       self.showPage(self.page_index)
+      self.root.title('Document Previewer - ' + os.path.basename(file_path))
     except Exception as e:
       logger.error(f"Error loading image: {type(e).__name__} - {str(e)}")
       self.showError(f"Error loading image: {type(e).__name__} - {str(e)}")
@@ -337,6 +285,7 @@ class DocumentPreviewer:
       self.photo = ImageTk.PhotoImage(resized_image)
       self.canvas.delete('all')
       self.canvas.create_image(window_width / 2, window_height / 2, anchor=tk.CENTER, image=self.photo)
+      self.root.update()
     except Exception as e:
       logger.error(f"Error resizing image: {type(e).__name__} - {str(e)}")
       self.showError(f"Error resizing image: {type(e).__name__} - {str(e)}")
@@ -362,18 +311,6 @@ class DocumentPreviewer:
       self.root = None
 
 def displayImage(file_path, viewer=None, default_width=720, default_height=960):
-  """
-  Displays an image using a document viewer.
-
-  Args:
-  - file_path (str): The path to the image file.
-  - viewer (DocumentPreviewer, optional): The document viewer to use. If not provided or None, a new viewer will be created.
-  - default_width (int, optional): The default width of the viewer window. Default is 720.
-  - default_height (int, optional): The default height of the viewer window. Default is 960.
-
-  Returns:
-  - viewer (DocumentPreviewer): The document viewer used to display the image.
-  """
   if viewer is None or not viewer.root.winfo_exists():
     viewer = DocumentPreviewer(file_path, default_width, default_height)
   else:
@@ -381,31 +318,6 @@ def displayImage(file_path, viewer=None, default_width=720, default_height=960):
   return viewer
 
 class FewShotDocumentProcessor:
-  """
-  Class for processing documents using a few-shot learning approach.
-  Args:
-    model_name (str): The name of the SentenceTransformer model to use for text encoding. Default is 'all-MiniLM-L6-v2'.
-    cache (object): An optional cache object to store and retrieve few-shot examples. Default is None.
-  Attributes:
-    device (str): The device (CPU or GPU) on which the model is loaded.
-    model (object): The SentenceTransformer model used for text encoding.
-    cache (object): The cache object for storing and retrieving few-shot examples.
-    text_weight (float): The weight assigned to text similarity in the combined scores. Default is 0.7.
-    layout_weight (float): The weight assigned to layout similarity in the combined scores. Default is 0.3.
-    threshold (float): The threshold for considering a category prediction. Default is 0.1.
-    scaler (object): The scaler object used for scaling layout features.
-  Methods:
-    extractFeatures(image_path):
-      Extracts text and layout features from an image.
-    loadFewShotExamples(csv_path, force_reload=False):
-      Loads few-shot examples from a CSV file or cache.
-    updateFewShotExamples(image_path, verified_category):
-      Updates the few-shot examples with a new example.
-    predict(image_path):
-      Predicts the category of an image using few-shot classification.
-    predictProba(image_path):
-      Predicts the category probabilities of an image using few-shot classification.
-  """
   def __init__(self, model_name='all-MiniLM-L6-v2', cache=None):
     self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     self.model = SentenceTransformer(model_name).to(self.device)
@@ -651,24 +563,6 @@ class FewShotCache:
     logger.info("Cache has been cleared")
 
 class ActiveLearningIDP:
-  """
-  ActiveLearningIDP class for processing documents using active learning.
-  Args:
-    few_shot_processor (object): The few-shot processor object.
-    threshold (float, optional): The confidence threshold for determining if a document needs review. Defaults to 0.5.
-  Attributes:
-    few_shot_processor (object): The few-shot processor object.
-    threshold (float): The confidence threshold for determining if a document needs review.
-    classifier (object): The random forest classifier.
-    learner (object): The active learner object.
-    queued_samples (list): A list of queued samples.
-    available_categories (set): A set of available categories.
-  Methods:
-    fitInitialModel: Fits the initial model using the few-shot examples.
-    processDocument: Processes a document and returns the result.
-    fetchSamples: Fetches a specified number of samples from the queued samples.
-    updateModel: Updates the model using the reviewed samples.
-  """
   def __init__(self, few_shot_processor, threshold=0.7):
     self.few_shot_processor = few_shot_processor
     self.threshold = threshold
@@ -750,8 +644,9 @@ class ActiveLearningIDP:
     self.fitInitialModel()
     self.queued_samples = [sample for sample in self.queued_samples if sample[1] not in [rs[1] for rs in reviewed_samples]]
 
-def userReview(sample, available_categories, previewer):
+def userReview(sample, available_categories, previewer, next_file_path=None):
   features, file_path, text, layout, predicted_category, confidence = sample
+  logger.debug(f"Reviewing document: {file_path}")
   previewer.show(file_path)
   print(f"\nReviewing document: {file_path}")
   print(f"\nInitial prediction: {predicted_category} (Confidence: {confidence:.2f})")
@@ -764,13 +659,19 @@ def userReview(sample, available_categories, previewer):
   while True:
     choice = input("\nAccept the prediction? (y) or enter the number of the correct category: ")
     if choice.lower() == 'y':
+      if next_file_path:
+        previewer.updateDocument(next_file_path)
       return features, file_path, text, layout, predicted_category
     try:
       choice = int(choice)
       if 1 <= choice <= len(available_categories):
+        if next_file_path:
+          previewer.updateDocument(next_file_path)
         return features, file_path, text, layout, list(available_categories)[choice-1]
       elif choice == len(available_categories) + 1:
         new_category = input("Enter the new category: ")
+        if next_file_path:
+          previewer.updateDocument(next_file_path)
         return features, file_path, text, layout, new_category
     except ValueError:
       pass
@@ -903,8 +804,11 @@ def processAllDocuments(file_paths: List[str], examples: str, batch_size: int = 
       logger.info(f'Found {len(samples_to_review)} samples to review')
       reviewed_samples = []
       for sample in samples_to_review:
-        reviewed_sample = userReview(sample, alIDP.available_categories, previewer)
+        next_file_path = samples_to_review[i + 1][1] if i + 1 < len(samples_to_review) else None
+        logger.debug(f'Attempting to review document: {sample[1]}')
+        reviewed_sample = userReview(sample, alIDP.available_categories, previewer, next_file_path)
         reviewed_samples.append(reviewed_sample)
+        logger.debug(f'Reviewed document: {sample[1]} - Category: {reviewed_sample[4]}')
       alIDP.updateModel(reviewed_samples)
       logger.info(f'Updated model with {len(reviewed_samples)} reviewed samples')
       previewer.closeWindow()    
