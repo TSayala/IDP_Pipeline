@@ -212,7 +212,7 @@ class DocumentPreviewer:
     self.default_width = default_width
     self.default_height = default_height
     self.root = None
-    self.label = None
+    self.canvas = None
     self.image = None
     self.photo = None
     self.page_index = 0
@@ -221,7 +221,7 @@ class DocumentPreviewer:
   def show(self, file_path):
     if self.root is None:
       self.root = tk.Tk()
-      self.root.title('Document Previewer - ' + os.path.basename(file_path))
+      self.root.title('Document Previewer')
       self.root.geometry(f"{self.default_width}x{self.default_height}")
       self.root.minsize(200, 200)
 
@@ -239,9 +239,9 @@ class DocumentPreviewer:
       self.root.update_idletasks()
       self.root.bind('<Configure>', self.onResize)
 
-      self.root.mainloop()
-    
     self.updateDocument(file_path)
+    self.root.update()
+    self.root.mainloop()
 
   def updateDocument(self, file_path):
     try:
@@ -644,7 +644,7 @@ class ActiveLearningIDP:
     self.fitInitialModel()
     self.queued_samples = [sample for sample in self.queued_samples if sample[1] not in [rs[1] for rs in reviewed_samples]]
 
-def userReview(sample, available_categories, previewer, next_file_path=None):
+def userReview(sample, available_categories, previewer):
   features, file_path, text, layout, predicted_category, confidence = sample
   logger.debug(f"Reviewing document: {file_path}")
   previewer.show(file_path)
@@ -659,19 +659,13 @@ def userReview(sample, available_categories, previewer, next_file_path=None):
   while True:
     choice = input("\nAccept the prediction? (y) or enter the number of the correct category: ")
     if choice.lower() == 'y':
-      if next_file_path:
-        previewer.updateDocument(next_file_path)
       return features, file_path, text, layout, predicted_category
     try:
       choice = int(choice)
       if 1 <= choice <= len(available_categories):
-        if next_file_path:
-          previewer.updateDocument(next_file_path)
         return features, file_path, text, layout, list(available_categories)[choice-1]
       elif choice == len(available_categories) + 1:
         new_category = input("Enter the new category: ")
-        if next_file_path:
-          previewer.updateDocument(next_file_path)
         return features, file_path, text, layout, new_category
     except ValueError:
       pass
@@ -804,14 +798,14 @@ def processAllDocuments(file_paths: List[str], examples: str, batch_size: int = 
       logger.info(f'Found {len(samples_to_review)} samples to review')
       reviewed_samples = []
       for sample in samples_to_review:
-        next_file_path = samples_to_review[i + 1][1] if i + 1 < len(samples_to_review) else None
         logger.debug(f'Attempting to review document: {sample[1]}')
-        reviewed_sample = userReview(sample, alIDP.available_categories, previewer, next_file_path)
+        reviewed_sample = userReview(sample, alIDP.available_categories, previewer)
         reviewed_samples.append(reviewed_sample)
         logger.debug(f'Reviewed document: {sample[1]} - Category: {reviewed_sample[4]}')
       alIDP.updateModel(reviewed_samples)
       logger.info(f'Updated model with {len(reviewed_samples)} reviewed samples')
-      previewer.closeWindow()    
+  if previewer.root:
+    previewer.root.destroy()   
 
   df = pd.DataFrame(all_results)
 
