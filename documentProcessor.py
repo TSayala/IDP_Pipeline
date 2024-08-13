@@ -455,13 +455,14 @@ class FewShotDocumentProcessor:
       except Exception as e:
         logger.error(f"Error loading few-shot examples: {type(e).__name__} - {str(e)}")
 
-  def updateFewShotExamples(self, image_path, verified_category):
-    text, layout = self.extractFeatures(image_path)
+  def updateFewShotExamples(self, image_path, text, layout, verified_category):
+    new_embedding = self.model.encode(text, convert_to_tensor=True)
     new_example = {
       'file_path': image_path,
       'category': verified_category,
       'text': text,
-      'layout': layout
+      'layout': layout,
+      'embedding': new_embedding
     }
     self.cache.update(new_example)
 
@@ -563,7 +564,8 @@ class FewShotCache:
   def update(self, new_example):
     self.few_shot_examples.append(new_example)
     text, layout = new_example['text'], new_example['layout']
-    self.few_shot_embeddings = torch.cat([self.few_shot_embeddings, self.model.encode([text], convert_to_tensor=True)])
+    new_embedding = new_example['embedding']
+    self.few_shot_embeddings = torch.cat([self.few_shot_embeddings, new_embedding])
     self.few_shot_layouts = np.vstack([self.few_shot_layouts, layout])
     self.scaler.partial_fit(layout.reshape(1, -1))
     self.save()
@@ -653,8 +655,9 @@ class ActiveLearningIDP:
       new_y.append(verified_category)
       self.available_categories.add(verified_category)
 
-      self.few_shot_processor.updateFewShotExamples(file_path, verified_category)
-    self.fitInitialModel()
+      self.few_shot_processor.updateFewShotExamples(file_path, text, layout, verified_category)
+    self.learner.fit(np.vstack(self.learner.X_training, np.array(new_X)),
+                     np.concatenate([self.learner.y_training, new_y]))
     self.queued_samples = [sample for sample in self.queued_samples if sample[1] not in [rs[1] for rs in reviewed_samples]]
 
 def userReview(sample, available_categories, previewer):
