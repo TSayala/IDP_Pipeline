@@ -6,6 +6,7 @@ import string
 import json
 import pickle
 import time
+import threading
 
 import torch
 import torch.nn as nn
@@ -56,17 +57,17 @@ def setupLogger(log_file='document_processor.log'):
 
   # Create handlers
   file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
-  console_handler = logging.StreamHandler()
+  #console_handler = logging.StreamHandler()
 
   # Create formatters
   file_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-  console_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+  #console_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
   file_handler.setFormatter(file_format)
-  console_handler.setFormatter(console_format)
+  #console_handler.setFormatter(console_format)
 
   # Add handlers to the logger
   logger.addHandler(file_handler)
-  logger.addHandler(console_handler)
+  #logger.addHandler(console_handler)
 
   return logger
 _logger = setupLogger()
@@ -217,31 +218,42 @@ class DocumentPreviewer:
     self.photo = None
     self.page_index = 0
     self.num_pages = 0
+    self.thread = None
+
+  def start(self):
+    self.thread = threading.Thread(target=self._run)
+    self.thread.daemon = True
+    self.thread.start()
+
+  def _run(self):
+    self.root = tk.Tk()
+    self.root.title('Document Previewer')
+    self.root.geometry(f"{self.default_width}x{self.default_height}")
+    self.root.minsize(200, 200)
+
+    self.canvas = tk.Canvas(self.root)
+    self.canvas.pack(expand=True, fill=tk.BOTH)
+
+    button_frame = tk.Frame(self.root)
+    button_frame.pack(side=tk.BOTTOM, fill=tk.X)
+
+    self.prev_button = tk.Button(button_frame, text="Previous", command=self.showPrevPage)
+    self.prev_button.pack(side=tk.LEFT)
+    self.next_button = tk.Button(button_frame, text="Next", command=self.showNextPage)
+    self.next_button.pack(side=tk.RIGHT)
+      
+    self.root.update_idletasks()
+    self.root.bind('<Configure>', self.onResize)
+
+    self.root.mainloop()
 
   def show(self, file_path):
-    if self.root is None:
-      self.root = tk.Tk()
-      self.root.title('Document Previewer')
-      self.root.geometry(f"{self.default_width}x{self.default_height}")
-      self.root.minsize(200, 200)
+    if not self.thread or not self.thread.is_alive():
+      self.start()
+    self.root.after(0, self.updateDocument, file_path)
 
-      self.canvas = tk.Canvas(self.root)
-      self.canvas.pack(expand=True, fill=tk.BOTH)
-
-      button_frame = tk.Frame(self.root)
-      button_frame.pack(side=tk.BOTTOM, fill=tk.X)
-
-      self.prev_button = tk.Button(button_frame, text="Previous", command=self.showPrevPage)
-      self.prev_button.pack(side=tk.LEFT)
-      self.next_button = tk.Button(button_frame, text="Next", command=self.showNextPage)
-      self.next_button.pack(side=tk.RIGHT)
-      
-      self.root.update_idletasks()
-      self.root.bind('<Configure>', self.onResize)
-
-    self.updateDocument(file_path)
-    self.root.update()
-    self.root.mainloop()
+  def isOpen(self):
+    return self.root and self.root.winfo_exists()
 
   def updateDocument(self, file_path):
     try:
@@ -274,12 +286,12 @@ class DocumentPreviewer:
     if window_width <= 1 or window_height <= 1:
       logger.warning(f"Invalid window size: {window_width}x{window_height}")
       return
-    logger.debug(f"Window size: {window_width}x{window_height}")
+    #logger.debug(f"Window size: {window_width}x{window_height}")
     img_width, img_height = self.image.size
     scale = min(window_width / img_width, window_height / img_height)
     new_width = int(img_width * scale)
     new_height = int(img_height * scale)
-    logger.debug(f"Resized image size: {new_width}x{new_height}")
+    #logger.debug(f"Resized image size: {new_width}x{new_height}")
     try:
       resized_image = self.image.resize((new_width, new_height), Image.LANCZOS)
       self.photo = ImageTk.PhotoImage(resized_image)
@@ -307,8 +319,9 @@ class DocumentPreviewer:
 
   def closeWindow(self):
     if self.root:
-      self.root.destroy()
+      self.root.quit()
       self.root = None
+      self.thread = None
 
 def displayImage(file_path, viewer=None, default_width=720, default_height=960):
   if viewer is None or not viewer.root.winfo_exists():
@@ -651,10 +664,10 @@ def userReview(sample, available_categories, previewer):
   print(f"\nReviewing document: {file_path}")
   print(f"\nInitial prediction: {predicted_category} (Confidence: {confidence:.2f})")
   
-  print("\nAvailable categories:")
-  for i, category in enumerate(available_categories):
-    print(f"{i+1}. {category}")
-  print(f"{len(available_categories)+1}. Other (Write-in)")
+#  print("\nAvailable categories:")
+#  for i, category in enumerate(available_categories):
+#    print(f"{i+1}. {category}")
+#  print(f"{len(available_categories)+1}. Other (Write-in)")
 
   while True:
     choice = input("\nAccept the prediction? (y) or enter the number of the correct category: ")
@@ -782,6 +795,7 @@ def processAllDocuments(file_paths: List[str], examples: str, batch_size: int = 
   alIDP = ActiveLearningIDP(analyzer)
   alIDP.fitInitialModel()
   previewer = DocumentPreviewer()
+  previewer.start()
  
   all_results = []
   total_batches = len(file_paths) // batch_size + (1 if len(file_paths) % batch_size else 0)
@@ -797,15 +811,21 @@ def processAllDocuments(file_paths: List[str], examples: str, batch_size: int = 
     if samples_to_review:
       logger.info(f'Found {len(samples_to_review)} samples to review')
       reviewed_samples = []
+      print("\nAvailable categories:")
+      for i, category in enumerate(alIDP.available_categories):
+        print(f"{i+1}. {category}")
+      print(f"{len(alIDP.available_categories)+1}. Other (Write-in)")
       for sample in samples_to_review:
         logger.debug(f'Attempting to review document: {sample[1]}')
         reviewed_sample = userReview(sample, alIDP.available_categories, previewer)
         reviewed_samples.append(reviewed_sample)
         logger.debug(f'Reviewed document: {sample[1]} - Category: {reviewed_sample[4]}')
+      logger.debug(f'Updating model with {len(reviewed_samples)} reviewed samples')
       alIDP.updateModel(reviewed_samples)
       logger.info(f'Updated model with {len(reviewed_samples)} reviewed samples')
-  if previewer.root:
-    previewer.root.destroy()   
+  if previewer.isOpen():
+    previewer.root.quit()
+    previewer.thread.join()
 
   df = pd.DataFrame(all_results)
 
