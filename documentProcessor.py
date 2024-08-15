@@ -1,20 +1,13 @@
-import psutil
 import os
 import re
-import io
 import string
-import json
 import pickle
-import time
 import threading
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
 
-from collections import Counter
 from typing import List, Tuple
 import unicodedata
 
@@ -25,17 +18,12 @@ import pytesseract
 import cv2
 
 from sentence_transformers import SentenceTransformer, util
-from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
 from sklearn.base import BaseEstimator, ClassifierMixin
 
 from modAL.models import ActiveLearner
 from modAL.uncertainty import uncertainty_sampling
-
-from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
-from transformers import BertTokenizer, BertModel
 
 import pandas as pd
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -51,23 +39,27 @@ CATEGORIES = [
 ] # Unused
 
 # Setup logging
-def setupLogger(log_file='document_processor.log'):
+def setupLogger(log_file='utils/document_processor.log'):
   logger = logging.getLogger('DocumentProcessor')
   logger.setLevel(logging.DEBUG)
 
   # Create handlers
   file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
-  #console_handler = logging.StreamHandler()
+  console_handler = logging.StreamHandler()
+
+  # Set log levels
+  file_handler.setLevel(logging.DEBUG)
+  console_handler.setLevel(logging.INFO)
 
   # Create formatters
   file_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-  #console_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+  console_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
   file_handler.setFormatter(file_format)
-  #console_handler.setFormatter(console_format)
+  console_handler.setFormatter(console_format)
 
   # Add handlers to the logger
   logger.addHandler(file_handler)
-  #logger.addHandler(console_handler)
+  logger.addHandler(console_handler)
 
   return logger
 _logger = setupLogger()
@@ -413,7 +405,7 @@ class FewShotDocumentProcessor:
         layouts = []
         categories = []
 
-        logger.debug("Extracting features from few-shot examples")
+        logger.info("Extracting features from few-shot examples")
         for _, row in df.iterrows():
           text, layout = self.extractFeatures(row['file_path'])
           texts.append(text)
@@ -432,15 +424,15 @@ class FewShotDocumentProcessor:
         if len(set(layout_shapes)) != 1:
           raise ValueError(f"Inconsistent layout dimensions: {layout_shapes}")
 
-        logger.debug("Encoding texts")
+        logger.info("Encoding texts")
         self.few_shot_embeddings = self.model.encode(texts, convert_to_tensor=True)
         logger.debug(f"Few-shot embeddings shape: {self.few_shot_embeddings.shape}")
 
-        logger.debug("Stacking layouts")
+        logger.info("Stacking layouts")
         self.few_shot_layouts = np.vstack(layouts)
         logger.debug(f"Few-shot layouts shape: {self.few_shot_layouts.shape}")
 
-        logger.debug("Fitting scaler")
+        logger.info("Fitting scaler")
         self.scaler = StandardScaler()
         self.scaler.fit(self.few_shot_layouts)
 
@@ -455,14 +447,13 @@ class FewShotDocumentProcessor:
       except Exception as e:
         logger.error(f"Error loading few-shot examples: {type(e).__name__} - {str(e)}")
 
-  def updateFewShotExamples(self, image_path, text, layout, verified_category):
-    new_embedding = self.model.encode(text, convert_to_tensor=True)
+  def updateFewShotExamples(self, image_path, text, layout, verified_category, text_embedding):
     new_example = {
       'file_path': image_path,
       'category': verified_category,
       'text': text,
       'layout': layout,
-      'embedding': new_embedding
+      'embedding': text_embedding
     }
     self.cache.update(new_example)
 
@@ -534,7 +525,7 @@ class FewShotClassifier(BaseEstimator, ClassifierMixin):
     return [list(self.few_shot_processor.predictProba(image_path).values()) for image_path in X]
 
 class FewShotCache:
-  def __init__(self, cache_file='data/examples/cache/few_shot_cache.pkl'):
+  def __init__(self, cache_file='utils/cache/few_shot_cache.pkl'):
     self.cache_file = cache_file
     self.few_shot_examples = None
     self.few_shot_embeddings = None
@@ -564,8 +555,8 @@ class FewShotCache:
   def update(self, new_example):
     self.few_shot_examples.append(new_example)
     text, layout = new_example['text'], new_example['layout']
-    new_embedding = new_example['embedding']
-    self.few_shot_embeddings = torch.cat([self.few_shot_embeddings, new_embedding])
+    new_embedding = new_example['embedding'].unsqueeze(0)
+    self.few_shot_embeddings = torch.cat([self.few_shot_embeddings, new_embedding], dim=0)
     self.few_shot_layouts = np.vstack([self.few_shot_layouts, layout])
     self.scaler.partial_fit(layout.reshape(1, -1))
     self.save()
@@ -609,9 +600,10 @@ class ActiveLearningIDP:
       'category': None,
       'confidence': None,
       'needs_review': False,
+      'corrected_category': None,
       'status': 'error',
       'error_message': None,
-      'text': None
+      'text': None,
     }
     try:
       logger.info(f"Processing document {file_path}")
@@ -654,35 +646,36 @@ class ActiveLearningIDP:
       new_X.append(features)
       new_y.append(verified_category)
       self.available_categories.add(verified_category)
-
-      self.few_shot_processor.updateFewShotExamples(file_path, text, layout, verified_category)
-    self.learner.fit(np.vstack(self.learner.X_training, np.array(new_X)),
-                     np.concatenate([self.learner.y_training, new_y]))
+      text_embedding = self.few_shot_processor.model.encode(text, convert_to_tensor=True)
+      self.few_shot_processor.updateFewShotExamples(file_path, text, layout, verified_category, text_embedding)
+    if self.learner.X_training is not None and len(self.learner.X_training) > 0:
+      self.learner.fit(
+        np.vstack([self.learner.X_training, np.array(new_X)]),
+        np.concatenate([self.learner.y_training, new_y])
+      )
+    else:
+      self.learner.fit(np.array(new_X), np.array(new_y))
     self.queued_samples = [sample for sample in self.queued_samples if sample[1] not in [rs[1] for rs in reviewed_samples]]
 
 def userReview(sample, available_categories, previewer):
   features, file_path, text, layout, predicted_category, confidence = sample
   logger.debug(f"Reviewing document: {file_path}")
   previewer.show(file_path)
-  print(f"\nReviewing document: {file_path}")
-  print(f"\nInitial prediction: {predicted_category} (Confidence: {confidence:.2f})")
-  
-#  print("\nAvailable categories:")
-#  for i, category in enumerate(available_categories):
-#    print(f"{i+1}. {category}")
-#  print(f"{len(available_categories)+1}. Other (Write-in)")
+  print(f"\n----------------------------------------")
+  print(f"Reviewing document: {file_path}")
+  print(f"Initial prediction: {predicted_category} (Confidence: {confidence:.2f})")
 
   while True:
     choice = input("\nAccept the prediction? (y) or enter the number of the correct category: ")
     if choice.lower() == 'y':
-      return features, file_path, text, layout, predicted_category
+      return (features, file_path, text, layout, predicted_category), None
     try:
       choice = int(choice)
       if 1 <= choice <= len(available_categories):
-        return features, file_path, text, layout, list(available_categories)[choice-1]
+        return (features, file_path, text, layout, list(available_categories)[choice-1]), list(available_categories)[choice-1]
       elif choice == len(available_categories) + 1:
         new_category = input("Enter the new category: ")
-        return features, file_path, text, layout, new_category
+        return (features, file_path, text, layout, new_category), new_category
     except ValueError:
       pass
     print("Invalid input. Please enter a valid category number or 'y' to accept the prediction")
@@ -797,8 +790,7 @@ def processAllDocuments(file_paths: List[str], examples: str, batch_size: int = 
   analyzer.loadFewShotExamples(examples, force_reload=force_reload)
   alIDP = ActiveLearningIDP(analyzer)
   alIDP.fitInitialModel()
-  previewer = DocumentPreviewer()
-  previewer.start()
+  previewer = None
  
   all_results = []
   total_batches = len(file_paths) // batch_size + (1 if len(file_paths) % batch_size else 0)
@@ -814,21 +806,35 @@ def processAllDocuments(file_paths: List[str], examples: str, batch_size: int = 
     if samples_to_review:
       logger.info(f'Found {len(samples_to_review)} samples to review')
       reviewed_samples = []
+
       print("\nAvailable categories:")
       for i, category in enumerate(alIDP.available_categories):
         print(f"{i+1}. {category}")
       print(f"{len(alIDP.available_categories)+1}. Other (Write-in)")
+
+      if previewer is None or not previewer.isOpen():
+        previewer = DocumentPreviewer()
+        previewer.start()
+
       for sample in samples_to_review:
         logger.debug(f'Attempting to review document: {sample[1]}')
-        reviewed_sample = userReview(sample, alIDP.available_categories, previewer)
+        reviewed_sample, corrected_category = userReview(sample, alIDP.available_categories, previewer)
         reviewed_samples.append(reviewed_sample)
         logger.debug(f'Reviewed document: {sample[1]} - Category: {reviewed_sample[4]}')
+        for result in all_results:
+          if result['file_path'] == reviewed_sample[1]:
+            result['corrected_category'] = corrected_category if corrected_category else reviewed_sample[4]
+        input("Press Enter to continue to the next document...")
+
       logger.debug(f'Updating model with {len(reviewed_samples)} reviewed samples')
       alIDP.updateModel(reviewed_samples)
       logger.info(f'Updated model with {len(reviewed_samples)} reviewed samples')
-  if previewer.isOpen():
+    
+  if previewer is not None and previewer.isOpen():
+    logger.info('Cleaning up resources')
     previewer.root.quit()
     previewer.thread.join()
+    logger.info('Resource cleanup complete')
 
   df = pd.DataFrame(all_results)
 

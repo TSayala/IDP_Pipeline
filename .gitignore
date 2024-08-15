@@ -3,3 +3,5 @@ document_processor.log
 testing/
 __pycache__/
 .vscode/
+utils/
+results/
