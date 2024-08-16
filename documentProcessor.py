@@ -31,15 +31,16 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 NUM_WORKERS = 6 # Change this to match the number of available CPU cores
-CATEGORIES = [
-  'plan of care', 'discharge summary', 'prescription request',
-  'progress note', 'prior authorization', 'lab results',
-  'result notification', 'formal records request', 'patient chart note',
-  'return to work', 'answering service', 'spam', 'other'
-] # Unused
 
 # Setup logging
-def setupLogger(log_file='utils/document_processor.log'):
+def setupLogger(log_file='utils/document_processor.log', verbose=False):
+  """Sets up the logger for the document processor.
+  Args:
+    log_file (str, optional): The path to the log file. Defaults to 'utils/document_processor.log'.
+    verbose (bool, optional): If True, sets the console log level to DEBUG. Defaults to False.
+  Returns:
+    logging.Logger: The configured logger.
+  """
   logger = logging.getLogger('DocumentProcessor')
   logger.setLevel(logging.DEBUG)
 
@@ -49,7 +50,7 @@ def setupLogger(log_file='utils/document_processor.log'):
 
   # Set log levels
   file_handler.setLevel(logging.DEBUG)
-  console_handler.setLevel(logging.INFO)
+  console_handler.setLevel(logging.DEBUG if verbose else logging.INFO)
 
   # Create formatters
   file_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -62,9 +63,18 @@ def setupLogger(log_file='utils/document_processor.log'):
   logger.addHandler(console_handler)
 
   return logger
-_logger = setupLogger()
-def getLogger():
+_logger = None
+
+def getLogger(verbose=False):
+  """Gets the logger instance, setting it up if necessary.
+  Args:
+    verbose (bool, optional): If True, sets the console log level to DEBUG. Defaults to False.
+  Returns:
+    logging.Logger: The logger instance.
+  """
   global _logger
+  if _logger is None:
+    _logger = setupLogger(verbose=verbose)
   return _logger
 logger = getLogger()
 
@@ -82,6 +92,12 @@ class TextCleaner:
     }
 
   def clean(self, text: str) -> str:
+    """Umbrella method to clean the given text by correcting common OCR errors.
+    Args:
+      text (str): The text to clean.
+    Returns:
+      str: The cleaned text.
+    """
     #text = self.removeNonPrintableChars(text)
     text = self.removeSpecialChars(text)
     text = self.removeHeaderFooter(text)
@@ -96,12 +112,9 @@ class TextCleaner:
     return ''.join(ch for ch in text if ch.isprintable())
   
   def fixLineBreaks(self, text: str) -> str:
-    """
-    Removes leading and trailing whitespaces from each line in the given text and joins them into a single string.
-
+    """Removes leading and trailing whitespaces from each line in the given text and joins them into a single string.
     Args:
       text (str): The input text containing multiple lines.
-
     Returns:
       str: The modified text with leading and trailing whitespaces removed from each line and joined into a single string.
     """
@@ -113,24 +126,18 @@ class TextCleaner:
     return ' '.join(fixed_lines)
   
   def removeExtraWhitespace(self, text: str) -> str:
-    """
-    Removes extra whitespace from the given text.
-
+    """Removes extra whitespace from the given text.
     Args:
       text (str): The input text.
-
     Returns:
       str: The text with extra whitespace removed.
     """
     return ' '.join(text.split())
   
   def correctCommonErrors(self, text: str) -> str:
-    """
-    Corrects common OCR errors in the given text.
-
+    """Corrects common OCR errors in the given text.
     Args:
       text (str): The text to be corrected.
-
     Returns:
       str: The corrected text.
     """
@@ -139,45 +146,33 @@ class TextCleaner:
     return text
   
   def removeSpecialChars(self, text: str) -> str:
-    """
-    Removes special characters from the given text.
-
+    """Removes special characters from the given text.
     Parameters:
     - text (str): The input text.
-
     Returns:
     - str: The text with special characters removed.
     """
     return re.sub(r'[^a-zA-Z0-9\s.,!?/-]', '', text)
   
   def normalizeUnicode(self, text: str) -> str:
-    """
-    Normalizes the given text by removing any Unicode characters and converting them to ASCII.
-
+    """Normalizes the given text by removing any Unicode characters and converting them to ASCII.
     Args:
       text (str): The input text to be normalized.
-
     Returns:
       str: The normalized text with Unicode characters removed and converted to ASCII.
     """
     return unicodedata.normalize('NFKD', text).encode('ASCII', 'ignore').decode('ASCII')
   
   def spellCheck(self, text: str) -> str:
-    """
-    [UNIMPLEMENTED] Perform spell checking on the input text.
-    """
+    """[UNIMPLEMENTED] Perform spell checking on the input text."""
     return text
   
   def correctWordSplits(self, text: str) -> str:
-    """
-    Corrects word splits in the given text.
-
+    """Corrects word splits in the given text.
     Args:
       text (str): The input text with potential word splits.
-
     Returns:
       str: The corrected text with word splits removed.
-
     Example:
       >>> processor = DocumentProcessor()
       >>> text = "This is a test-\ning example."
@@ -187,21 +182,22 @@ class TextCleaner:
     return re.sub(r'(\w+)-\s*\n\s*(\w+)', r'\1\2', text)
   
   def isHeaderFooter(self, line: str) -> bool:
-    """
-    Helper method to identify potential header and footer text.
-    """
+    """Helper method to identify potential header and footer text."""
     return bool(re.match(r'(page \d+/\d+|[ivxlcdm]+)', line.strip().lower()))
   
   def removeHeaderFooter(self, text: str) -> str:
-    """
-    Remove header and footer text from the input text.
-    """
+    """Remove header and footer text from the input text."""
     lines = text.splitlines()
     cleaned_lines = [line for line in lines if not self.isHeaderFooter(line)]
     return '\n'.join(cleaned_lines)
 
 class DocumentPreviewer:
   def __init__(self, default_width=800, default_height=1000):
+    """Initializes the DocumentPreviewer.
+    Args:
+        default_width (int, optional): The default width of the preview window. Defaults to 800.
+        default_height (int, optional): The default height of the preview window. Defaults to 1000.
+    """
     self.default_width = default_width
     self.default_height = default_height
     self.root = None
@@ -213,11 +209,13 @@ class DocumentPreviewer:
     self.thread = None
 
   def start(self):
+    """Starts the document previewer in a new thread."""
     self.thread = threading.Thread(target=self._run)
     self.thread.daemon = True
     self.thread.start()
 
   def _run(self):
+    """Runs the main loop of the document previewer."""
     self.root = tk.Tk()
     self.root.title('Document Previewer')
     self.root.geometry(f"{self.default_width}x{self.default_height}")
@@ -240,14 +238,26 @@ class DocumentPreviewer:
     self.root.mainloop()
 
   def show(self, file_path):
+    """Displays the document specified by the file path.
+    Args:
+      file_path (str): The path to the document file.
+    """
     if not self.thread or not self.thread.is_alive():
       self.start()
     self.root.after(0, self.updateDocument, file_path)
 
   def isOpen(self):
+    """Checks if the previewer window is open.
+    Returns:
+      bool: True if the previewer window is open, False otherwise.
+    """
     return self.root and self.root.winfo_exists()
 
   def updateDocument(self, file_path):
+    """Updates the document being displayed.
+    Args:
+      file_path (str): The path to the new document file.
+    """
     try:
       self.image = Image.open(file_path)
       self.num_pages = getattr(self.image, 'n_frames', 1)
@@ -259,10 +269,19 @@ class DocumentPreviewer:
       self.showError(f"Error loading image: {type(e).__name__} - {str(e)}")
 
   def onResize(self, event):
+    """Handle the resize event.
+    Args:
+      event: The resize event object.
+    """
     if self.image:
       self.showPage(self.page_index)
 
   def showPage(self, index):
+    """
+    Displays the specified page of the document.
+    Args:
+      index (int): The index of the page to be displayed.
+    """
     if not self.image:
       return
     try:
@@ -273,6 +292,7 @@ class DocumentPreviewer:
       self.showError(f"Error displaying page: {index} - {type(e).__name__} - {str(e)}")
 
   def resizeAndDisplay(self):
+    """Resizes and displays the current image on the canvas."""
     window_width = self.canvas.winfo_width()
     window_height = self.canvas.winfo_height()
     if window_width <= 1 or window_height <= 1:
@@ -295,27 +315,43 @@ class DocumentPreviewer:
       self.showError(f"Error resizing image: {type(e).__name__} - {str(e)}")
 
   def showError(self, message):
+    """Displays an error message on the canvas.
+    Args:
+      message (str): The error message to display.
+    """
     if self.canvas:
       self.canvas.delete('all')
       self.canvas.create_text(self.canvas.winfo_width() / 2, self.canvas.winfo_height() / 2, text=message, font=('Arial', 16), anchor=tk.CENTER)
 
   def showPrevPage(self):
+    """Displays the previous page of the document."""
     if self.page_index > 0:
       self.page_index -= 1
       self.showPage(self.page_index)
 
   def showNextPage(self):
+    """Displays the next page of the document."""
     if self.page_index < self.num_pages - 1:
       self.page_index += 1
       self.showPage(self.page_index)
 
   def closeWindow(self):
+    """Closes the window and cleans up resources."""
     if self.root:
       self.root.quit()
       self.root = None
       self.thread = None
 
 def displayImage(file_path, viewer=None, default_width=720, default_height=960):
+  """Displays an image in a document viewer.
+    Args:
+      file_path (str): The path to the image file.
+      viewer (DocumentPreviewer, optional): An existing document viewer instance. Defaults to None.
+      default_width (int, optional): The default width of the viewer window. Defaults to 720.
+      default_height (int, optional): The default height of the viewer window. Defaults to 960.
+    Returns:
+      DocumentPreviewer: The document viewer instance.
+    """
   if viewer is None or not viewer.root.winfo_exists():
     viewer = DocumentPreviewer(file_path, default_width, default_height)
   else:
@@ -324,6 +360,11 @@ def displayImage(file_path, viewer=None, default_width=720, default_height=960):
 
 class FewShotDocumentProcessor:
   def __init__(self, model_name='all-MiniLM-L6-v2', cache=None):
+    """Initializes the FewShotDocumentProcessor.
+      Args:
+        model_name (str, optional): The name of the model to use. Defaults to 'all-MiniLM-L6-v2'.
+        cache (FewShotCache, optional): An optional cache for storing results. Defaults to None.
+      """
     self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     self.model = SentenceTransformer(model_name).to(self.device)
     self.cache = cache if cache else FewShotCache()
@@ -333,6 +374,12 @@ class FewShotDocumentProcessor:
     self.scaler = None
 
   def extractFeatures(self, image_path):
+    """Extracts features from an image.
+    Args:
+      image_path (str): The path to the image file.
+    Returns:
+      tuple: A tuple containing the extracted text and layout features.
+    """
     try:
       # extract text using OCR
       text, pages = readTifFile(image_path)
@@ -389,12 +436,18 @@ class FewShotDocumentProcessor:
       return None, np.zeros((1, 6))
 
   def loadFewShotExamples(self, csv_path, force_reload=False):
+    """Loads few-shot examples from a CSV file or cache.
+    Args:
+      csv_path (str): The path to the CSV file containing few-shot examples.
+      force_reload (bool, optional): If True, forces reloading from the CSV file even if cache is available, overriding the cache. Defaults to False.
+    """
     if not force_reload and self.cache.load():
-      logger.info("Few-shot examples loaded from cache")
+      logger.info("Loading few-shot examples from cache")
       self.few_shot_examples = self.cache.few_shot_examples
       self.few_shot_embeddings = self.cache.few_shot_embeddings
       self.few_shot_layouts = self.cache.few_shot_layouts
       self.scaler = self.cache.scaler
+      logger.info("Few-shot examples loaded from cache")
     else:
       logger.info("Few-shot examples not found in cache. Loading from CSV file")
       try:
@@ -408,6 +461,9 @@ class FewShotDocumentProcessor:
         logger.info("Extracting features from few-shot examples")
         for _, row in df.iterrows():
           text, layout = self.extractFeatures(row['file_path'])
+          if text is None:
+            logger.warning(f"Error extracting text for {row['file_path']}. Check if the file exists. Skipping...")
+            continue
           texts.append(text)
           layouts.append(layout)
           categories.append(row['category'])
@@ -448,6 +504,14 @@ class FewShotDocumentProcessor:
         logger.error(f"Error loading few-shot examples: {type(e).__name__} - {str(e)}")
 
   def updateFewShotExamples(self, image_path, text, layout, verified_category, text_embedding):
+    """Updates the few-shot examples with a new example.
+    Args:
+      image_path (str): The path to the image file.
+      text (str): The extracted text from the image.
+      layout (np.ndarray): The layout features of the image.
+      verified_category (str): The verified category of the image.
+      text_embedding (torch.Tensor): The text embedding of the extracted text.
+    """
     new_example = {
       'file_path': image_path,
       'category': verified_category,
@@ -458,6 +522,14 @@ class FewShotDocumentProcessor:
     self.cache.update(new_example)
 
   def predict(self, image_path):
+    """Updates the few-shot examples with a new example.
+    Args:
+      image_path (str): The path to the image file.
+      text (str): The extracted text from the image.
+      layout (np.ndarray): The layout features of the image.
+      verified_category (str): The verified category of the image.
+      text_embedding (torch.Tensor): The text embedding of the extracted text.
+    """
     text, layout = self.extractFeatures(image_path)
     if text is None or layout is None:
       return 'Error', 0.0
@@ -487,6 +559,12 @@ class FewShotDocumentProcessor:
       return 'other', float(normalized_scores[0])
   
   def predictProba(self, image_path):
+    """Predicts the category probabilities of the given image.
+    Args:
+      image_path (str): The path to the image file.
+    Returns:
+      tuple: A tuple containing the predicted category (str) and the confidence score (float).
+    """
     text, layout = self.extractFeatures(image_path)
     if text is None or layout is None:
       return 'Error', 0.0
@@ -512,6 +590,10 @@ class FewShotDocumentProcessor:
     return category_probs
 
 class FewShotClassifier(BaseEstimator, ClassifierMixin):
+  """A scikit-learn compatible wrapper for the FewShotDocumentProcessor.
+  Args:
+    few_shot_processor (FewShotDocumentProcessor): The processor used for few-shot learning.
+  """
   def __init__(self, few_shot_processor):
     self.few_shot_processor = few_shot_processor
 
@@ -525,7 +607,15 @@ class FewShotClassifier(BaseEstimator, ClassifierMixin):
     return [list(self.few_shot_processor.predictProba(image_path).values()) for image_path in X]
 
 class FewShotCache:
+  """A cache for storing few-shot learning examples and their features.
+  Args:
+      cache_file (str, optional): The path to the cache file. Defaults to 'utils/cache/few_shot_cache.pkl'.
+  """
   def __init__(self, cache_file='utils/cache/few_shot_cache.pkl'):
+    """Initializes the FewShotCache.
+    Args:
+      cache_file (str, optional): The path to the cache file. Defaults to 'utils/cache/few_shot_cache.pkl'.
+    """
     self.cache_file = cache_file
     self.few_shot_examples = None
     self.few_shot_embeddings = None
@@ -533,6 +623,7 @@ class FewShotCache:
     self.scaler = None
 
   def save(self):
+    """Saves the few-shot examples and their features to the cache file."""
     with open(self.cache_file, 'wb') as f:
       pickle.dump({
         'few_shot_examples': self.few_shot_examples,
@@ -542,6 +633,10 @@ class FewShotCache:
       }, f)
 
   def load(self):
+    """Loads the few-shot examples and their features from the cache file.
+    Returns:
+      bool: True if the cache was successfully loaded, False otherwise.
+    """
     if os.path.exists(self.cache_file):
       with open(self.cache_file, 'rb') as f:
         data = pickle.load(f)
@@ -553,6 +648,10 @@ class FewShotCache:
     return False
   
   def update(self, new_example):
+    """Updates the cache with a new few-shot example.
+    Args:
+      new_example (dict): The new few-shot example containing 'file_path', 'category', 'text', 'layout', and 'embedding'.
+    """
     self.few_shot_examples.append(new_example)
     text, layout = new_example['text'], new_example['layout']
     new_embedding = new_example['embedding'].unsqueeze(0)
@@ -562,6 +661,7 @@ class FewShotCache:
     self.save()
   
   def clear(self):
+    """Can be called to remove the cache file, forcing the cache to be regenerated."""
     if os.path.exists(self.cache_file):
       os.remove(self.cache_file)
       logger.info(f"Cache file {self.cache_file} has been removed")
@@ -570,6 +670,11 @@ class FewShotCache:
 
 class ActiveLearningIDP:
   def __init__(self, few_shot_processor, threshold=0.7):
+    """Initializes the ActiveLearningIDP.
+    Args:
+      few_shot_processor (FewShotDocumentProcessor): The processor used for few-shot learning.
+      threshold (float, optional): The threshold for uncertainty sampling. Defaults to 0.7.
+    """
     self.few_shot_processor = few_shot_processor
     self.threshold = threshold
     self.classifier = RandomForestClassifier(n_estimators=100, random_state=42)
@@ -581,6 +686,7 @@ class ActiveLearningIDP:
     self.available_categories = set()
 
   def fitInitialModel(self):
+    """Fits the initial model using the few-shot examples."""
     examples = self.few_shot_processor.cache.few_shot_examples
     X = []
     y = []
@@ -595,6 +701,12 @@ class ActiveLearningIDP:
     self.learner.fit(X, y)
 
   def processDocument(self, file_path):
+    """Processes a document and predicts its category.
+    Args:
+      file_path (str): The path to the document file.
+    Returns:
+      dict: A dictionary containing the processing result, including the predicted category, confidence, and other metadata.
+    """
     result = {
       'file_path': file_path,
       'category': None,
@@ -634,12 +746,22 @@ class ActiveLearningIDP:
     return result
 
   def fetchSamples(self, n_samples=10):
+    """Fetches a specified number of samples from the queued samples.
+    Args:
+      n_samples (int, optional): The number of samples to fetch. Defaults to 10.
+    Returns:
+      list: A list of samples.
+    """
     if len(self.queued_samples) < n_samples:
       return self.queued_samples
     else:
       return self.queued_samples[:n_samples]
     
   def updateModel(self, reviewed_samples):
+    """Updates the model with reviewed samples.
+    Args:
+      reviewed_samples (list): A list of reviewed samples, each containing features, file path, text, layout, and verified category.
+    """
     new_X = []
     new_y = []
     for features, file_path, text, layout, verified_category in reviewed_samples:
@@ -658,6 +780,14 @@ class ActiveLearningIDP:
     self.queued_samples = [sample for sample in self.queued_samples if sample[1] not in [rs[1] for rs in reviewed_samples]]
 
 def userReview(sample, available_categories, previewer):
+  """Allows the user to review and verify the predicted category of a sample.
+  Args:
+    sample (tuple): A tuple containing features, file path, text, layout, predicted category, and confidence.
+    available_categories (list): A list of available categories.
+    previewer (object): An object to preview the document.
+  Returns:
+    tuple: A tuple containing the reviewed sample and the new category if added, otherwise None.
+  """
   features, file_path, text, layout, predicted_category, confidence = sample
   logger.debug(f"Reviewing document: {file_path}")
   previewer.show(file_path)
@@ -681,6 +811,12 @@ def userReview(sample, available_categories, previewer):
     print("Invalid input. Please enter a valid category number or 'y' to accept the prediction")
 
 def isFaxCover(text: str) -> Tuple[bool, List[Tuple[str, int]]]:
+  """Determines if the given text is a fax cover sheet.
+  Args:
+    text (str): The text to analyze.
+  Returns:
+    Tuple[bool, List[Tuple[str, int]]]: A tuple containing a boolean indicating if the text is a fax cover sheet and a list of matched keywords with their counts.
+  """
   keywords = ['fax', 'cover', 'sheet', 'attached']
   text = text.lower()
   matched_keywords = []
@@ -694,12 +830,14 @@ def isFaxCover(text: str) -> Tuple[bool, List[Tuple[str, int]]]:
   return keyword_count >= 2, matched_keywords
 
 def readTifFile(file_path: str) -> Tuple[str, List[np.ndarray]]:
-  """
-  Reads a TIF file and extracts text from it using OCR.
+  """Reads a TIF file and extracts text from it using OCR.
   Iterates by page and returns cleaned text and images for each page if a fax cover page is not detected.
 
-  returns:
-  Tuple[str, List[np.ndarray]]: A tuple containing the cleaned text and a list of images.
+  Args:
+    file_path (str): The path to the TIF file.
+
+  Returns:
+    Tuple[str, List[np.ndarray]]: A tuple containing the cleaned text and a list of images.
   """
   cleaner = TextCleaner()
   try:
@@ -731,6 +869,7 @@ def readTifFile(file_path: str) -> Tuple[str, List[np.ndarray]]:
     raise
 
 def processOneDocument(args: Tuple[str, FewShotDocumentProcessor]) -> dict:
+  "Currently unused"
   file_path, analyzer = args
 
   result = {
@@ -771,6 +910,13 @@ def processOneDocument(args: Tuple[str, FewShotDocumentProcessor]) -> dict:
   return result
 
 def processBatch(batch: List[str], analyzer: FewShotDocumentProcessor) -> List[dict]:
+  """Processes a batch of documents using a FewShotDocumentProcessor.
+  Args:
+    batch (List[str]): A list of file paths to the documents to be processed.
+    analyzer (FewShotDocumentProcessor): The document processor used for analysis.
+  Returns:
+    List[dict]: A list of dictionaries containing the processing results for each document.
+  """
   results = []
   with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
     future_to_file = {executor.submit(processOneDocument, (file_path, analyzer)): file_path for file_path in batch}
@@ -781,15 +927,34 @@ def processBatch(batch: List[str], analyzer: FewShotDocumentProcessor) -> List[d
   return results
 
 def batchGenerator(file_paths, batch_size):
+  """Generates batches of file paths.
+  Args:
+    file_paths (List[str]): A list of file paths to be batched.
+    batch_size (int): The size of each batch.
+  Yields:
+    List[str]: A batch of file paths.
+  """
   for i in range(0, len(file_paths), batch_size):
     yield file_paths[i:i+batch_size]
 
 def processAllDocuments(file_paths: List[str], examples: str, batch_size: int = 30, force_reload: bool = False) -> pd.DataFrame:
+  """Processes all documents in the given file paths using few-shot learning.
+  Args:
+    file_paths (List[str]): A list of file paths to the documents to be processed.
+    examples (str): The path to the CSV file containing few-shot examples.
+    batch_size (int, optional): The size of each batch. Defaults to 30.
+    force_reload (bool, optional): If True, forces reloading of few-shot examples from the CSV file. Defaults to False.
+  Returns:
+    pd.DataFrame: A DataFrame containing the processing results for all documents.
+  """
   cache = FewShotCache()
   analyzer = FewShotDocumentProcessor(cache=cache)
   analyzer.loadFewShotExamples(examples, force_reload=force_reload)
   alIDP = ActiveLearningIDP(analyzer)
+  logger.debug(f'Loaded {len(analyzer.few_shot_examples)} few-shot examples from cache')
+  logger.debug('fitting initial model')
   alIDP.fitInitialModel()
+  logger.debug('initial model fitted')
   previewer = None
  
   all_results = []
@@ -842,6 +1007,13 @@ def processAllDocuments(file_paths: List[str], examples: str, batch_size: int = 
   return df
 
 def fetchFiles(directory):
+  """
+  Fetches all TIF files in the specified directory.
+  Args:
+    directory (str): The directory path to search for TIF files.
+  Returns:
+    list: A list of file paths for all TIF files found in the directory.
+  """
   files = [os.path.join(directory, file) for file in os.listdir(directory) if file.lower().endswith('.tif')]
   logger.info(f'Found {len(files)} TIF files in directory: {directory}')
   return files

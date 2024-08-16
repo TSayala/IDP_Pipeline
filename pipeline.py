@@ -1,12 +1,18 @@
 # Document Classification Pipeline
-import psutil
+import argparse
 import os
+import psutil
 from pytictoc import TicToc
 import pandas as pd
 from documentProcessor import processAllDocuments, getLogger, fetchFiles
 
+# Parse arguments
+parser = argparse.ArgumentParser(description='Run the document processing pipeline.')
+parser.add_argument('--verbose', action='store_true', help='Enable verbose logging')
+args = parser.parse_args()
+
 # Initialize logger and timer
-logger = getLogger()
+logger = getLogger(verbose=args.verbose)
 t = TicToc()
 
 # Set CPU affinity
@@ -16,7 +22,7 @@ logger.info("INITIALIZING DOCUMENT PROCESSING PIPELINE >>>>>>>>>>>>>>>>>>>>>>>>>
 logger.info(f"CPU affinity set to cores {core_constraint}")
 
 # Define file paths and fetch files
-fsExamples = 'utils/examples.csv'
+fsExamples = 'utils/examples2.csv'
 folder = 'examples2'  # Set the folder to process
 directory = 'data/' + folder + '/'
 tif_files = fetchFiles(directory)
